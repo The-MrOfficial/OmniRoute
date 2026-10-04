@@ -20,6 +20,7 @@ import {
   sortTargetsByUsage,
 } from "./targetSorters.ts";
 import { decrementInflight } from "./quotaShareInflight.ts";
+import { nextDispatchSequenceStart } from "./rrState.ts";
 import type { ComboLike, ComboLogger, ResolvedComboTarget } from "./types.ts";
 
 /**
@@ -59,6 +60,52 @@ export interface ApplyStrategyOrderingDeps {
  * previous inline behavior (the chain had no trailing `else`). The `auto` strategy
  * is handled separately by `resolveAutoStrategyOrder` and never reaches here.
  */
+/**
+ * Rotate `priority` targets to follow `config.dispatchSequence`.
+ *
+ * `dispatchSequence` is an ordered list of step ids (repeats allowed). The head
+ * of the returned order follows the sequence rotated by the per-combo cursor
+ * (see {@link nextDispatchSequenceStart}), so concurrent requests start at
+ * successive sequence entries. Targets whose step id is not named in the
+ * sequence are appended as the tail in their original relative order (the
+ * fall-through-to-rest-of-combo targets). Duplicate step entries (e.g. two
+ * distinct 5090 steps) are kept as distinct targets so the attempt loop can try
+ * the second when the first is skipped at capacity.
+ *
+ * Returns the input order unchanged when the sequence is empty/invalid or
+ * matches no target, preserving plain-priority behavior.
+ */
+function applyDispatchSequenceOrdering(
+  orderedTargets: ResolvedComboTarget[],
+  comboName: string,
+  dispatchSequence: string[],
+  log: ComboLogger
+): ResolvedComboTarget[] {
+  const sequenced = new Set<string>();
+  const seqTargets: ResolvedComboTarget[] = [];
+  for (const stepId of dispatchSequence) {
+    const matches = orderedTargets.filter((target) => target.stepId === stepId);
+    if (matches.length === 0) {
+      log.warn(
+        "COMBO",
+        `dispatchSequence step id "${stepId}" matched no target in combo "${comboName}" — skipping`
+      );
+      continue;
+    }
+    for (const match of matches) {
+      seqTargets.push(match);
+      sequenced.add(match.stepId);
+    }
+  }
+
+  if (seqTargets.length === 0) return orderedTargets;
+
+  const start = nextDispatchSequenceStart(comboName, seqTargets.length);
+  const rotated = [...seqTargets.slice(start), ...seqTargets.slice(0, start)];
+  const tail = orderedTargets.filter((target) => !sequenced.has(target.stepId));
+  return [...rotated, ...tail];
+}
+
 export async function applyStrategyOrdering(
   strategy: string,
   initialOrderedTargets: ResolvedComboTarget[],
@@ -117,6 +164,32 @@ export async function applyStrategyOrdering(
       }
     } catch (err) {
       log.warn("COMBO", "Failed to retrieve Last Known Good Provider. This is non-fatal.", { err });
+    }
+  } else if (strategy === "priority") {
+    // Plain `priority` applies no reordering (declared array order). When the
+    // combo opts in to `config.dispatchSequence` (an ordered list of step ids,
+    // repeats allowed), rotate the head per concurrent request so a target
+    // sequence like [5090a, 4070ti, 5090b, glm] is dispatched in exact order,
+    // one entry per simultaneous job. Everything downstream — the per-connection
+    // concurrency skip gate, the fail-safe advance to the next entry, and the
+    // fall-through to tier 2 — is unchanged; this only chooses the start offset.
+    const dispatchSequence = config.dispatchSequence;
+    if (Array.isArray(dispatchSequence) && dispatchSequence.length > 0) {
+      const sequenceIds = dispatchSequence.filter(
+        (id): id is string => typeof id === "string" && id.length > 0
+      );
+      if (sequenceIds.length > 0) {
+        orderedTargets = applyDispatchSequenceOrdering(
+          orderedTargets,
+          combo.name,
+          sequenceIds,
+          log
+        );
+        log.info(
+          "COMBO",
+          `Dispatch-sequence ordering: ${orderedTargets[0]?.modelStr}${orderedTargets[0]?.connectionId ? ` (${orderedTargets[0].connectionId})` : ""} first (${orderedTargets.length} targets)`
+        );
+      }
     }
   } else if (strategy === "strict-random") {
     const selectedExecutionKey = await getNextFromDeck(

@@ -184,6 +184,13 @@ export const comboRuntimeConfigSchema = z
     // A positive value replaces that safety net for this combo.
     comboTimeoutMs: z.coerce.number().int().min(0).max(MAX_TIMER_TIMEOUT_MS).optional(),
     concurrencyPerModel: z.coerce.number().int().min(1).max(20).optional(),
+    // Priority-strategy ordered dispatch: an ordered list of step ids (the `id`
+    // field of entries in `models`), repeats allowed. When set on a `priority`
+    // combo, applyStrategyOrdering rotates the resolved targets so each
+    // concurrent request starts at the next sequence entry, dispatching the
+    // targets in exact order (one per simultaneous job) with the per-connection
+    // concurrency gate as the fail-safe skip. Inert for every other strategy.
+    dispatchSequence: z.array(z.string().trim().min(1).max(200)).max(100).optional(),
     queueTimeoutMs: z.coerce.number().int().min(1000).max(120000).optional(),
     // #3872: pre-cascade semaphore queue depth (round-robin). 0 = fail over immediately.
     queueDepth: z.coerce.number().int().min(0).max(100).optional(),
