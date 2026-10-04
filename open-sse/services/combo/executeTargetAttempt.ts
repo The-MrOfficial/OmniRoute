@@ -91,7 +91,7 @@ import {
 } from "./executeTargetGates.ts";
 import { recordLkgpPin } from "./recordLkgpPin.ts";
 import { acquireConnectionConcurrencySlot } from "./connectionConcurrencyGate.ts";
-import { lookupPositiveCap } from "./concurrencyCaps.ts";
+import { resolveConnectionModelCap } from "./concurrencyCaps.ts";
 import { resolveComboQueueDepth } from "../comboConfig.ts";
 import {
   buildComboDiag,
@@ -374,11 +374,15 @@ export async function executeTargetAttempt(opts: {
         decision: "dispatched",
       });
     }
-    // #esnixi-5090: process-global per-connection concurrency ceiling.
-    // Acquire ONE slot on the global `conn:<connectionId>` semaphore before the
-    // upstream dispatch so two different combos targeting the SAME connection
-    // (e.g. hybrid/code + hybrid/research both listing the 5090 27B, cap=2)
-    // share one ceiling instead of each admitting up to the cap independently.
+    // #esnixi-5090: process-global per-(connection, model) concurrency ceiling.
+    // Acquire ONE slot on the global `conn:<connectionId>:<model>` semaphore
+    // before the upstream dispatch. Two different combos targeting the SAME
+    // (connection, model) (e.g. hybrid/code + hybrid/research both listing the
+    // 5090 27B, cap=2) share one ceiling instead of each admitting up to the cap
+    // independently; two DIFFERENT models on one connection (4070 Ti 27B vs 9B)
+    // get independent ceilings. The cap is resolved per (connection, model):
+    // a positive `weightedTargetPolicies[model].maxConcurrent` override wins,
+    // else the connection's own maxConcurrent, else null (no limit).
     // Reconciliation (see connectionConcurrencyGate.ts header): round-robin never
     // reaches here, and quota-share already holds its own `qsconn:` slot around
     // the whole dispatch — so skip this gate for quota-share to keep exactly ONE
@@ -386,9 +390,14 @@ export async function executeTargetAttempt(opts: {
     // Fail-open everywhere (no connection / cap<=0 / saturated queue → no slot).
     let connectionConcurrencyRelease: (() => void) | null = null;
     if (deps.strategy !== "quota-share") {
-      const connCap = await lookupPositiveCap(target.connectionId ?? "").catch(() => null);
+      const connCap = await resolveConnectionModelCap({
+        combo: deps.combo,
+        modelStr,
+        connectionId: target.connectionId,
+      }).catch(() => null);
       connectionConcurrencyRelease = await acquireConnectionConcurrencySlot(
         target.connectionId,
+        modelStr,
         connCap,
         {
           queueTimeoutMs: (deps.config.queueTimeoutMs as number | undefined) ?? 120000,

@@ -20,8 +20,9 @@
  */
 
 import { getCachedProviderConnectionById } from "@/lib/db/readCache";
+import { isRecord } from "./comboData.ts";
 import { effectiveMaxConcurrency } from "./comboPredicates.ts";
-import type { ResolvedComboTarget } from "./types.ts";
+import type { ComboLike, ResolvedComboTarget } from "./types.ts";
 
 /** Read a connection's positive `maxConcurrent`, or null when unset / <= 0 / on error. */
 export async function lookupPositiveCap(connectionId: string): Promise<number | null> {
@@ -32,6 +33,55 @@ export async function lookupPositiveCap(connectionId: string): Promise<number | 
   } catch {
     return null; // fail-open: never block routing on a lookup error
   }
+}
+
+/**
+ * Read the combo's per-target policy map, mirroring targetInputPolicy.ts:
+ * prefer `combo.config.weightedTargetPolicies`, fall back to the top-level
+ * `combo.weightedTargetPolicies`. Each entry is keyed by the full
+ * `provider/model` string.
+ */
+function getWeightedTargetPolicies(combo: ComboLike): Record<string, unknown> | null {
+  const config = isRecord(combo.config) ? combo.config : null;
+  const fromConfig =
+    config && isRecord(config.weightedTargetPolicies) ? config.weightedTargetPolicies : null;
+  if (fromConfig) return fromConfig;
+  return isRecord(combo.weightedTargetPolicies) ? combo.weightedTargetPolicies : null;
+}
+
+/** A positive finite integer `maxConcurrent` override for `modelStr`, else null. */
+function readPerModelCap(
+  policies: Record<string, unknown> | null,
+  modelStr: string
+): number | null {
+  if (!policies) return null;
+  // Primary lookup is the full `provider/model` key; the bare-model key is a
+  // defensive fallback (matches targetInputPolicy.ts's key resolution).
+  const bareModel = modelStr.includes("/") ? modelStr.slice(modelStr.indexOf("/") + 1) : modelStr;
+  for (const key of [modelStr, bareModel]) {
+    const entry = policies[key];
+    if (!isRecord(entry)) continue;
+    const value = entry.maxConcurrent;
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value);
+  }
+  return null;
+}
+
+/**
+ * Resolve the per-(connection, model) concurrency cap at dispatch time, in order:
+ *   (1) `combo.config.weightedTargetPolicies[modelStr].maxConcurrent` when a
+ *       positive finite int (the operator's per-model override);
+ *   (2) else the connection's own positive `maxConcurrent` (lookupPositiveCap);
+ *   (3) else `null` (no limit — fail-open).
+ */
+export async function resolveConnectionModelCap(params: {
+  combo: ComboLike;
+  modelStr: string;
+  connectionId: string | null | undefined;
+}): Promise<number | null> {
+  const override = readPerModelCap(getWeightedTargetPolicies(params.combo), params.modelStr);
+  if (override !== null) return override;
+  return await lookupPositiveCap(params.connectionId ?? "");
 }
 
 /**

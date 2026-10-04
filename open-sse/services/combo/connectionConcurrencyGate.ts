@@ -1,6 +1,6 @@
 /**
- * connectionConcurrencyGate.ts — Process-global per-connection concurrency ceiling
- * for the priority / dispatchSequence / fallback execution path (#esnixi-5090).
+ * connectionConcurrencyGate.ts — Process-global per-(connection, model) concurrency
+ * ceiling for the priority / dispatchSequence / fallback execution path (#esnixi-5090).
  *
  * BUG this closes: a provider connection's `maxConcurrent` ceiling was enforced
  * PER COMBO DISPATCH, not globally. When two different combos that both list the
@@ -9,10 +9,20 @@
  * makeConnectionConcurrencyResolver (concurrencyCaps.ts) and independently admitted
  * up to 2 → 2+2, and 3 concurrent requests were observed on the connection.
  *
- * THE FIX: a single process-global, connection-scoped semaphore keyed
- * `conn:<connectionId>`, acquired once around the upstream dispatch in
- * executeTargetAttempt. Two different combos targeting the same connection now
- * share one ceiling, so the Nth-over-cap request WAITS instead of flooding.
+ * A SECOND bug this closes: keying the gate on `conn:<connectionId>` ALONE made
+ * every model hosted on one connection share a single ceiling. The 4070 Ti
+ * connection hosts both a 27B coder (per-model cap 1) and a 9B reader (cap 4);
+ * under a connection-only key the 27B could run 4 concurrent because it inherited
+ * the connection's maxConcurrent. The key now includes the model so each
+ * (connection, model) pair gets an independent ceiling.
+ *
+ * THE FIX: a single process-global semaphore keyed `conn:<connectionId>:<model>`,
+ * acquired once around the upstream dispatch in executeTargetAttempt, with a
+ * per-(connection, model) cap resolved at dispatch time. Two different combos
+ * targeting the SAME (connection, model) still share one ceiling (the 5090 27B
+ * across hybrid/code + hybrid/research — the Nth-over-cap request WAITS instead
+ * of flooding), while two DIFFERENT models on one connection (4070 Ti 27B vs 9B)
+ * now get independent ceilings.
  *
  * RECONCILIATION — exactly ONE global ceiling per request path, no double-acquire:
  *   - Round-robin never reaches executeTargetAttempt (combo.ts early-returns into
@@ -40,9 +50,13 @@
 
 import * as semaphore from "../rateLimitSemaphore.ts";
 
-/** Stable, connection-scoped semaphore key for the global per-connection gate. */
-export function connectionConcurrencyKey(connectionId: string): string {
-  return `conn:${connectionId}`;
+/**
+ * Stable, (connection, model)-scoped semaphore key for the global gate. Two
+ * combos sharing the same (connection, model) share one ceiling; two different
+ * models on one connection get independent ceilings.
+ */
+export function connectionConcurrencyKey(connectionId: string, model: string): string {
+  return `conn:${connectionId}:${model}`;
 }
 
 export interface ConnectionSlotOptions {
@@ -68,13 +82,14 @@ interface SlotLogger {
  */
 export async function acquireConnectionConcurrencySlot(
   connectionId: string | null | undefined,
+  model: string | null | undefined,
   cap: number | null,
   opts: ConnectionSlotOptions,
   log: SlotLogger
 ): Promise<(() => void) | null> {
-  if (!connectionId || cap === null || cap <= 0) return null;
+  if (!connectionId || !model || cap === null || cap <= 0) return null;
   try {
-    return await semaphore.acquire(connectionConcurrencyKey(connectionId), {
+    return await semaphore.acquire(connectionConcurrencyKey(connectionId, model), {
       maxConcurrency: cap,
       timeoutMs: opts.queueTimeoutMs,
       maxQueueSize: opts.maxQueueSize,
@@ -84,7 +99,7 @@ export async function acquireConnectionConcurrencySlot(
     // proceed without a slot rather than reject a dispatchable request.
     log.warn(
       "COMBO",
-      `Connection concurrency: connection ${connectionId} gate saturated (cap=${cap}) — proceeding without a slot`
+      `Connection concurrency: connection ${connectionId} model ${model} gate saturated (cap=${cap}) — proceeding without a slot`
     );
     return null;
   }
