@@ -146,6 +146,27 @@ function runAttempt(deps: AttemptLoopDeps, target: ResolvedComboTarget) {
   });
 }
 
+/**
+ * Run executeTargetAttempt for a chosen ordered-target INDEX, returning both the
+ * result and the shared state so a test can inspect fallbackCount after a skip.
+ * `orderedTargets` carries ≥2 entries so a skip at index 0 models "overflow to
+ * the next target" and an attempt at index 1 models the next target dispatching.
+ */
+function runAttemptAt(deps: AttemptLoopDeps, orderedTargets: ResolvedComboTarget[], index: number) {
+  const abortControllers = new Map<number, AbortController>();
+  orderedTargets.forEach((_, i) => abortControllers.set(i, new AbortController()));
+  const state = emptyState({ orderedTargets, abortControllers });
+  const result = executeTargetAttempt({
+    index,
+    state,
+    deps,
+    targetForAttempt: orderedTargets[index],
+    profile: {},
+    protectedPriorityTarget: false,
+  });
+  return { result, state };
+}
+
 const MODEL_5090_27B = "vllm/qwen3.8-27b-nvfp4";
 const MODEL_4070_27B = "ollama-local/qwen3.8:27b-iq3-code144k";
 const MODEL_4070_9B = "ollama-local/qwen3.5-reader:9b";
@@ -453,4 +474,230 @@ test("quota-share does NOT acquire a conn: slot (keeps its own qsconn: gate, no 
   releaseGate!();
   const result = await p;
   assert.equal(result?.ok, true);
+});
+
+const MODEL_GLM = "zai/glm-5.3";
+
+/**
+ * HARD CAP (follow-up): for a local GPU provider the per-(connection, model)
+ * ceiling is a HARD cap. When a slot cannot be acquired within the queue window,
+ * the request must NOT be dispatched to that target — it SKIPS to the next
+ * ordered target (overflow), the shared semaphore never exceeds the cap even at
+ * timeout, and the saturated model's handleSingleModel is never invoked for the
+ * over-cap request.
+ */
+test("HARD cap (vllm): cap=2, 3rd dispatch TIMES OUT and SKIPS to next target (never 3, no dispatch-anyway)", async () => {
+  semaphore.resetAll();
+  const connectionId = "esnixi-5090-hard";
+  seedConnection(connectionId, "vllm", 2);
+  const key = connectionConcurrencyKey(connectionId, MODEL_5090_27B);
+
+  // The two holders block inside handleSingleModel; the 3rd must time out on the
+  // gate (short queueTimeoutMs, queue deep enough to WAIT not fail-fast) and skip
+  // BEFORE handleSingleModel — so it never dispatches to the saturated model.
+  let releaseGate: (() => void) | null = null;
+  const gate = new Promise<void>((r) => {
+    releaseGate = r;
+  });
+  let maxConcurrentHandle = 0;
+  let liveHandle = 0;
+  let handleCalls = 0;
+  const makeDeps = (name: string) =>
+    baseDeps({
+      // Short queue timeout + a non-zero queue so the 3rd WAITS then times out
+      // (the real timeout→skip path, not an instant queue-full fail).
+      config: { queueTimeoutMs: 50, queueDepth: 5 },
+      combo: { name, models: [] },
+      handleSingleModelWithTimeout: async () => {
+        handleCalls++;
+        liveHandle++;
+        maxConcurrentHandle = Math.max(maxConcurrentHandle, liveHandle);
+        try {
+          await gate;
+          return json200(connectionId);
+        } finally {
+          liveHandle--;
+        }
+      },
+    });
+
+  const target = modelTarget({ connectionId, modelStr: MODEL_5090_27B, provider: "vllm" });
+  // Two holders from two different combos.
+  const p1 = runAttempt(makeDeps("comboA"), target);
+  const p2 = runAttempt(makeDeps("comboB"), target);
+  await wait(20);
+  assert.equal(semaphore.getStats()[key]?.running, 2, "two holders in flight");
+
+  // The 3rd arrives with a next target available: index 0 is the saturated 5090,
+  // index 1 is GLM (the overflow target). The hard cap must skip index 0.
+  const next = modelTarget({
+    connectionId: "glm-conn",
+    modelStr: MODEL_GLM,
+    provider: "zai",
+    executionKey: "ek-glm",
+  });
+  const { result: thirdResult, state: thirdState } = runAttemptAt(
+    makeDeps("comboC"),
+    [target, next],
+    0
+  );
+  const third = await thirdResult;
+
+  assert.equal(third, null, "the 3rd attempt SKIPS (returns null) — overflow to next target");
+  assert.equal(
+    semaphore.getStats()[key]?.running,
+    2,
+    "the shared semaphore NEVER exceeds the cap of 2, even at timeout"
+  );
+  assert.ok(
+    maxConcurrentHandle <= 2,
+    `handleSingleModel never ran more than 2 at once (saw ${maxConcurrentHandle})`
+  );
+  assert.equal(handleCalls, 2, "the 3rd request did NOT dispatch to the saturated model");
+  assert.equal(thirdState.fallbackCount, 0, "a skip at index 0 does not bump fallbackCount");
+
+  releaseGate!();
+  const results = await Promise.all([p1, p2]);
+  for (const r of results) assert.equal(r?.ok, true, "the two holders still succeed");
+  assert.equal(semaphore.getStats()[key], undefined, "all slots released");
+});
+
+test("HARD cap: a skip at a FALLBACK index (i>0) bumps fallbackCount and the next target still dispatches", async () => {
+  semaphore.resetAll();
+  const connectionId = "esnixi-5090-hard-fb";
+  seedConnection(connectionId, "vllm", 1);
+  const key = connectionConcurrencyKey(connectionId, MODEL_5090_27B);
+
+  let releaseGate: (() => void) | null = null;
+  const gate = new Promise<void>((r) => {
+    releaseGate = r;
+  });
+  const makeDeps = (name: string) =>
+    baseDeps({
+      config: { queueTimeoutMs: 50, queueDepth: 5 },
+      combo: { name, models: [] },
+      handleSingleModelWithTimeout: async () => {
+        await gate;
+        return json200(connectionId);
+      },
+    });
+
+  const saturated = modelTarget({ connectionId, modelStr: MODEL_5090_27B, provider: "vllm" });
+  // Hold the single slot.
+  const holder = runAttempt(makeDeps("holder"), saturated);
+  await wait(20);
+  assert.equal(semaphore.getStats()[key]?.running, 1, "the only slot is held");
+
+  // A fallback chain where the saturated 5090 is at index 1 (i>0): skipping it
+  // must bump fallbackCount, modelling overflow deeper in the chain.
+  const primary = modelTarget({
+    connectionId: "primary-conn",
+    modelStr: "vllm/other-model",
+    provider: "vllm",
+    executionKey: "ek-primary",
+  });
+  const { result, state } = runAttemptAt(makeDeps("fbcombo"), [primary, saturated], 1);
+  const skipped = await result;
+
+  assert.equal(skipped, null, "the saturated fallback target SKIPS");
+  assert.equal(state.fallbackCount, 1, "a skip at i>0 bumps fallbackCount (overflow accounting)");
+
+  releaseGate!();
+  await holder;
+  assert.equal(semaphore.getStats()[key], undefined, "slot released");
+});
+
+/**
+ * Non-hard providers keep the historical FAIL-OPEN: on saturation they dispatch
+ * anyway (availability is never worsened for cloud/subscription targets).
+ */
+test("FAIL-OPEN (cloud): a non-hard provider still dispatches on saturation", async () => {
+  semaphore.resetAll();
+  const connectionId = "openrouter-conn";
+  seedConnection(connectionId, "openrouter", 2);
+  const key = connectionConcurrencyKey(connectionId, MODEL_GLM);
+
+  let releaseGate: (() => void) | null = null;
+  const gate = new Promise<void>((r) => {
+    releaseGate = r;
+  });
+  let handleCalls = 0;
+  const makeDeps = (name: string) =>
+    baseDeps({
+      config: { queueTimeoutMs: 50, queueDepth: 5 },
+      combo: { name, models: [] },
+      handleSingleModelWithTimeout: async () => {
+        handleCalls++;
+        await gate;
+        return json200(connectionId);
+      },
+    });
+  const target = modelTarget({ connectionId, modelStr: MODEL_GLM, provider: "openrouter" });
+
+  // Fill the cap with two holders.
+  const p1 = runAttempt(makeDeps("c1"), target);
+  const p2 = runAttempt(makeDeps("c2"), target);
+  await wait(20);
+  assert.equal(semaphore.getStats()[key]?.running, 2, "two holders fill the cloud cap");
+
+  // The 3rd saturates the gate but, being a cloud provider, FAILS OPEN: it must
+  // dispatch anyway (handleSingleModel is invoked a 3rd time).
+  const p3 = runAttempt(makeDeps("c3"), target);
+  await wait(120); // > queueTimeoutMs so the gate times out and fail-open fires
+  assert.equal(
+    handleCalls,
+    3,
+    "cloud provider dispatches the 3rd request on saturation (fail-open)"
+  );
+
+  releaseGate!();
+  const results = await Promise.all([p1, p2, p3]);
+  for (const r of results) assert.equal(r?.ok, true, "all three cloud dispatches succeed");
+});
+
+/**
+ * All targets saturated/exhausted must surface as the normal combo-exhausted
+ * outcome (a skip/null that the outer loop turns into a retryable error), NOT a
+ * dispatch-anyway and NOT a crash.
+ */
+test("HARD cap all-saturated: the only hard target skips (null) — no dispatch, no crash", async () => {
+  semaphore.resetAll();
+  const connectionId = "esnixi-5090-exhausted";
+  seedConnection(connectionId, "vllm", 1);
+  const key = connectionConcurrencyKey(connectionId, MODEL_5090_27B);
+
+  let releaseGate: (() => void) | null = null;
+  const gate = new Promise<void>((r) => {
+    releaseGate = r;
+  });
+  let handleCalls = 0;
+  const makeDeps = (name: string) =>
+    baseDeps({
+      config: { queueTimeoutMs: 50, queueDepth: 5 },
+      combo: { name, models: [] },
+      handleSingleModelWithTimeout: async () => {
+        handleCalls++;
+        await gate;
+        return json200(connectionId);
+      },
+    });
+  const target = modelTarget({ connectionId, modelStr: MODEL_5090_27B, provider: "vllm" });
+
+  // Hold the only slot, then fire the over-cap request against a SINGLE-target
+  // chain (no overflow target) — it must skip (null) without dispatching.
+  const holder = runAttempt(makeDeps("holder"), target);
+  await wait(20);
+  const over = await runAttempt(makeDeps("over"), target);
+
+  assert.equal(
+    over,
+    null,
+    "all-saturated → skip (null) so the outer loop surfaces combo-exhausted"
+  );
+  assert.equal(handleCalls, 1, "only the holder dispatched; the over-cap request never did");
+  assert.equal(semaphore.getStats()[key]?.running, 1, "cap never exceeded");
+
+  releaseGate!();
+  await holder;
+  assert.equal(semaphore.getStats()[key], undefined, "slot released after the holder completes");
 });

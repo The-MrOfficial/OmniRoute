@@ -43,12 +43,67 @@
  * Unifying quota-share onto `conn:` is deliberately NOT done here to avoid changing
  * quota-share's proven behavior / other lanes.
  *
- * FAIL-OPEN, exactly like acquireQuotaShareConcurrencySlot: no connectionId /
- * cap === null / cap <= 0 → no limit; a saturated queue / timeout → proceed WITHOUT
- * a slot rather than ever failing a dispatchable request.
+ * FAIL-OPEN vs HARD-CAP, decided by the CALLER on the `saturated` outcome: no
+ * connectionId / cap === null / cap <= 0 → `no-limit` (dispatch, unchanged); a
+ * successful acquire → `acquired` (dispatch, release when done); a saturated
+ * queue / timeout → `saturated`. For cloud/subscription providers the caller
+ * keeps the historical FAIL-OPEN (dispatch WITHOUT a slot). For local GPU
+ * providers (vllm/ollama-local/llama-cpp, see isHardConcurrencyProvider) the
+ * caller treats `saturated` as a HARD cap and SKIPS the target so the request
+ * overflows to the next ordered target instead of over-subscribing the GPU.
  */
 
 import * as semaphore from "../rateLimitSemaphore.ts";
+
+/**
+ * Default local GPU providers whose per-(connection, model) ceiling is a HARD
+ * cap: on saturation the request SKIPS to the next target instead of dispatching
+ * anyway. Over-subscribing a single-GPU backend causes OOM/thrash, so these must
+ * never exceed their configured concurrency. Overridable via
+ * OMNIROUTE_HARD_CONCURRENCY_PROVIDERS (comma-separated).
+ */
+const DEFAULT_HARD_CONCURRENCY_PROVIDERS = ["vllm", "ollama-local", "llama-cpp"] as const;
+
+/**
+ * Resolve the hard-cap provider set from OMNIROUTE_HARD_CONCURRENCY_PROVIDERS
+ * (comma-separated, trimmed + lowercased, empties filtered), falling back to the
+ * local-GPU default when unset or empty. Read per call — env is cheap and this
+ * matches how other env flags are read inline in this codebase.
+ */
+function resolveHardConcurrencyProviders(): string[] {
+  const raw = process.env.OMNIROUTE_HARD_CONCURRENCY_PROVIDERS;
+  if (typeof raw === "string") {
+    const parsed = raw
+      .split(",")
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry.length > 0);
+    if (parsed.length > 0) return parsed;
+  }
+  return [...DEFAULT_HARD_CONCURRENCY_PROVIDERS];
+}
+
+/**
+ * True when `provider` is a local GPU backend whose per-(connection, model)
+ * ceiling must be enforced as a HARD cap (skip-to-next-target on saturation)
+ * rather than the fail-open default used for cloud/subscription providers.
+ */
+export function isHardConcurrencyProvider(provider: string | null | undefined): boolean {
+  if (!provider) return false;
+  return resolveHardConcurrencyProviders().includes(provider.trim().toLowerCase());
+}
+
+/**
+ * Discriminated result of a connection-concurrency slot acquisition.
+ *
+ * - `acquired`: a slot is held; `release` MUST be called exactly once when the
+ *   request finishes (for streaming, only AFTER the stream is fully consumed).
+ * - `no-limit`: no cap applies (missing connection/model, `cap === null`, or
+ *   `cap <= 0`) — dispatch with no slot.
+ * - `saturated`: the queue timed out or was full. The caller decides: hard-cap
+ *   providers SKIP the target; non-hard providers FAIL OPEN and dispatch anyway.
+ */
+export type ConnectionSlotResult =
+  { outcome: "acquired"; release: () => void } | { outcome: "no-limit" } | { outcome: "saturated" };
 
 /**
  * Stable, (connection, model)-scoped semaphore key for the global gate. Two
@@ -73,12 +128,16 @@ interface SlotLogger {
 /**
  * Acquire the process-global per-connection concurrency slot for a dispatch.
  *
- * Returns a release callback to invoke once the request finishes (for streaming
- * responses: only AFTER the stream is fully consumed/aborted — see the caller),
- * or `null` when no limit applies (missing connection, `cap === null`,
- * `cap <= 0`) or the gate is saturated. Fail-open is deliberate: this layer must
- * never make a dispatchable request fail — a full queue / timeout proceeds
- * WITHOUT a slot.
+ * Returns a discriminated {@link ConnectionSlotResult}: `acquired` with a release
+ * callback (for streaming responses, release only AFTER the stream is fully
+ * consumed/aborted — see the caller), `no-limit` when no cap applies (missing
+ * connection/model, `cap === null`, `cap <= 0`), or `saturated` when the queue
+ * timed out or was full. The queue still waits up to `queueTimeoutMs` before
+ * reporting `saturated`, so brief bursts wait rather than instantly overflowing.
+ *
+ * This layer no longer decides dispatch-vs-skip: the CALLER maps `saturated`
+ * onto fail-open (dispatch anyway) for cloud/subscription providers or
+ * skip-to-next-target for hard-cap local providers (see isHardConcurrencyProvider).
  */
 export async function acquireConnectionConcurrencySlot(
   connectionId: string | null | undefined,
@@ -86,21 +145,24 @@ export async function acquireConnectionConcurrencySlot(
   cap: number | null,
   opts: ConnectionSlotOptions,
   log: SlotLogger
-): Promise<(() => void) | null> {
-  if (!connectionId || !model || cap === null || cap <= 0) return null;
+): Promise<ConnectionSlotResult> {
+  if (!connectionId || !model || cap === null || cap <= 0) return { outcome: "no-limit" };
   try {
-    return await semaphore.acquire(connectionConcurrencyKey(connectionId, model), {
+    const release = await semaphore.acquire(connectionConcurrencyKey(connectionId, model), {
       maxConcurrency: cap,
       timeoutMs: opts.queueTimeoutMs,
       maxQueueSize: opts.maxQueueSize,
     });
+    return { outcome: "acquired", release };
   } catch {
-    // Fail-open: a saturated queue / timeout must never worsen availability —
-    // proceed without a slot rather than reject a dispatchable request.
+    // A saturated queue / timeout. The caller decides what this means: a cloud
+    // provider fails open (dispatch without a slot, preserving availability),
+    // while a hard-cap local provider skips this target so it never exceeds its
+    // GPU concurrency. Log at debug — the caller logs the resulting decision.
     log.warn(
       "COMBO",
-      `Connection concurrency: connection ${connectionId} model ${model} gate saturated (cap=${cap}) — proceeding without a slot`
+      `Connection concurrency: connection ${connectionId} model ${model} gate saturated (cap=${cap})`
     );
-    return null;
+    return { outcome: "saturated" };
   }
 }

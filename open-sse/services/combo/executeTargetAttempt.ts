@@ -90,7 +90,10 @@ import {
   readConnectionForCooldownGate,
 } from "./executeTargetGates.ts";
 import { recordLkgpPin } from "./recordLkgpPin.ts";
-import { acquireConnectionConcurrencySlot } from "./connectionConcurrencyGate.ts";
+import {
+  acquireConnectionConcurrencySlot,
+  isHardConcurrencyProvider,
+} from "./connectionConcurrencyGate.ts";
 import { resolveConnectionModelCap } from "./concurrencyCaps.ts";
 import { resolveComboQueueDepth } from "../comboConfig.ts";
 import {
@@ -387,7 +390,17 @@ export async function executeTargetAttempt(opts: {
     // reaches here, and quota-share already holds its own `qsconn:` slot around
     // the whole dispatch — so skip this gate for quota-share to keep exactly ONE
     // ceiling per request path and avoid a self-deadlock across its re-dispatch.
-    // Fail-open everywhere (no connection / cap<=0 / saturated queue → no slot).
+    //
+    // Saturation (queue timeout / full) is resolved by PROVIDER policy, not here:
+    //   - local GPU providers (vllm/ollama-local/llama-cpp, see
+    //     isHardConcurrencyProvider) treat the ceiling as a HARD cap — the
+    //     request is NOT dispatched; it SKIPS to the next ordered target (4070 Ti
+    //     → GLM → tier-2) exactly like an at-capacity pre-dispatch skip, so an
+    //     over-cap request OVERFLOWS instead of over-subscribing the GPU;
+    //   - cloud/subscription providers keep the historical FAIL-OPEN (dispatch
+    //     without a slot) so availability is never worsened.
+    // The bounded wait is preserved for both: a brief burst still queues up to
+    // queueTimeoutMs before `saturated` is reported.
     let connectionConcurrencyRelease: (() => void) | null = null;
     if (deps.strategy !== "quota-share") {
       const connCap = await resolveConnectionModelCap({
@@ -395,7 +408,7 @@ export async function executeTargetAttempt(opts: {
         modelStr,
         connectionId: target.connectionId,
       }).catch(() => null);
-      connectionConcurrencyRelease = await acquireConnectionConcurrencySlot(
+      const slot = await acquireConnectionConcurrencySlot(
         target.connectionId,
         modelStr,
         connCap,
@@ -405,6 +418,27 @@ export async function executeTargetAttempt(opts: {
         },
         deps.log
       );
+      if (slot.outcome === "acquired") {
+        connectionConcurrencyRelease = slot.release;
+      } else if (slot.outcome === "saturated" && isHardConcurrencyProvider(provider)) {
+        // HARD cap: the local GPU target is at its ceiling and could not acquire
+        // a slot within the queue window. Do NOT dispatch — SKIP to the next
+        // target, mirroring the pre-dispatch "is at max concurrency cap" skip.
+        deps.log.info(
+          "COMBO",
+          `Skipping ${modelStr} — connection ${target.connectionId} is at max concurrency cap (hard) — overflowing to next target`
+        );
+        recordComboDecision(deps.traceInvocationId, {
+          step: target.executionKey,
+          target: modelStr,
+          decision: "skipped_before_dispatch",
+          reason: "concurrency_cap_hard",
+        });
+        if (i > 0) state.fallbackCount++;
+        return null;
+      }
+      // Otherwise `no-limit`, or `saturated` on a non-hard provider → fail open:
+      // connectionConcurrencyRelease stays null and dispatch proceeds as before.
     }
     // Idempotent release guard shared by the finally and the stream wrapper so a
     // slot is freed exactly once. For a STREAMING success the finally hands off
