@@ -11,6 +11,7 @@ import { StatusDot } from "@/shared/components/flow/StatusDot";
 import { edgeStyle, FLOW_EDGE_COLORS, flowColorAlpha } from "@/shared/components/flow/edgeStyles";
 import { getFallbackProviderColor } from "@/shared/utils/providerFallbackColor";
 import { resolveTopologyNodeLabel } from "./topologyLabel";
+import { isTopologyEntryInSet } from "./topologyUtils";
 
 // Rings: [capacity, rx, ry]. Each successive ring fits ~6 more nodes.
 const RINGS: [number, number, number][] = [
@@ -46,6 +47,8 @@ type ProviderNodeData = {
   healthy: boolean;
   /** Most recently routed provider. Orthogonal to health — it can be last *and* healthy. */
   last: boolean;
+  /** Click-through id when it differs from the node key (provider-node row id). */
+  routeId?: string;
 };
 
 function ProviderNode({ data }: { data: ProviderNodeData }) {
@@ -169,7 +172,14 @@ const nodeTypes: NodeTypes = {
 };
 
 type ProviderHealth = "active" | "error" | "idle";
-type ProviderEntry = { id?: string; provider: string; name?: string; status?: ProviderHealth };
+type ProviderEntry = {
+  id?: string;
+  provider: string;
+  name?: string;
+  status?: ProviderHealth;
+  aliases?: string[];
+  routeId?: string;
+};
 
 function getHandles(angle: number, cx: number): { sourceHandle: string; targetHandle: string } {
   const rel = (((angle + Math.PI / 2) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
@@ -209,10 +219,9 @@ function buildLayout(
   // Sort: active → error → last-used → healthy(connected) → rest (alpha within groups)
   const sorted = [...providers].sort((a, b) => {
     const rank = (p: ProviderEntry) => {
-      const id = p.provider.toLowerCase();
-      if (activeSet.has(id)) return 0;
-      if (errorSet.has(id) || p.status === "error") return 1;
-      if (lastSet.has(id)) return 2;
+      if (isTopologyEntryInSet(p, activeSet)) return 0;
+      if (isTopologyEntryInSet(p, errorSet) || p.status === "error") return 1;
+      if (isTopologyEntryInSet(p, lastSet)) return 2;
       if (p.status === "active") return 3;
       return 4;
     };
@@ -227,13 +236,12 @@ function buildLayout(
 
     for (let i = 0; i < count; i++) {
       const p = sorted[provIdx++];
-      const pid = p.provider.toLowerCase();
-      const active = activeSet.has(pid);
+      const active = isTopologyEntryInSet(p, activeSet);
       // Traffic signals (live/recent request) take precedence; connection health is the
       // base state shown when a provider has no in-flight or recent traffic, so the map
       // still reflects "what is connected" at rest instead of going blank after a restart.
-      const trafficError = !active && errorSet.has(pid);
-      const last = !active && !trafficError && lastSet.has(pid);
+      const trafficError = !active && isTopologyEntryInSet(p, errorSet);
+      const last = !active && !trafficError && isTopologyEntryInSet(p, lastSet);
       // Health is orthogonal to recency: having just served a request does not make a
       // connection any less connected. `last` used to suppress `healthy`/`healthError`,
       // and because the node had no `last` visual it fell all the way through to the idle
@@ -262,6 +270,7 @@ function buildLayout(
           error,
           healthy,
           last,
+          routeId: p.routeId,
         } satisfies ProviderNodeData,
         draggable: false,
       });
@@ -334,9 +343,8 @@ export default function ProviderTopology({
   const handleNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node) => {
       if (node.type !== "provider") return;
-      const providerId =
-        (node.data as ProviderNodeData | undefined)?.providerId ||
-        node.id.replace(/^provider-/, "");
+      const data = node.data as ProviderNodeData | undefined;
+      const providerId = data?.routeId || data?.providerId || node.id.replace(/^provider-/, "");
       if (providerId) {
         router.push(`/dashboard/providers/${providerId}`);
       }

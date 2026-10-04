@@ -20,8 +20,10 @@ import {
 import { createTranslationFailureResult } from "./chatCore/translationFailure.ts";
 import {
   estimateFinalInputTokenBreakdown,
-  estimateFinalInputTokens,
+  formatFinalInputTokenBreakdown,
 } from "./chatCore/contextEstimation.ts";
+import { willForwardAssistantReasoning } from "../translator/reasoningForwarding.ts";
+import { resolveComboTargetInputPolicy } from "../services/combo/targetInputPolicy.ts";
 import {
   extractSystemRoleMessages,
   hoistLeadingTextSystemMessages,
@@ -45,7 +47,10 @@ import { buildPostCallGuardrailContext } from "./chatCore/postCallGuardrailConte
 import { storeSemanticCacheResponse } from "./chatCore/semanticCacheStore.ts";
 import { buildNonStreamingResponseHeaders } from "./chatCore/nonStreamingResponseHeaders.ts";
 import { maybeWrapForcedNonStreamingResponsesJson } from "./chatCore/responsesJsonToSse.ts";
-import { enforceOutputTokenBudget } from "./chatCore/outputTokenBudget.ts";
+import {
+  enforceOutputTokenBudget,
+  resolveOutputReserveTokens,
+} from "./chatCore/outputTokenBudget.ts";
 import { maybeConvertJsonBodyToSse } from "./chatCore/jsonBodyToSse.ts";
 import { withResilienceActionsContext } from "./chatCore/resilienceAttemptContext.ts";
 import { runEmptyTurnRetryLoop } from "./chatCore/emptyTurnRetryLoop.ts";
@@ -192,7 +197,7 @@ import {
   supportsMaxTokens,
   getResolvedModelCapabilities,
   getExplicitModelOutputCap,
-  resolveInputTokenCapForGate,
+  resolveInputTokenCapForGateWithSource,
 } from "@/lib/modelCapabilities.ts";
 import {
   checkRequestCapabilityFit,
@@ -1376,6 +1381,11 @@ async function handleChatCoreInner({
     targetFormat,
     backgroundReason,
     log,
+    // Freeze injected memory per conversation so the system-message prefix stays
+    // byte-stable turn to turn. sessionAffinityKey covers explicit session headers,
+    // body session ids, and the first-user-message hash; conversationId is the
+    // hash-chain tracker fallback.
+    conversationKey: sessionAffinityKey || explicitSessionIdHeader || conversationId || null,
   });
   body = injectionResult.body;
   const memorySettings = injectionResult.memorySettings;
@@ -1421,6 +1431,19 @@ async function handleChatCoreInner({
   // further down — see #8378 (context limit resolved by the combo was silently
   // discarded because it only existed inside this `if` block).
   let contextLimit = getTokenLimit(provider, effectiveModel);
+  // Same strip/forward predicate translateRequest uses: historical assistant
+  // reasoning that the translator strips for this target never reaches the
+  // upstream prompt, so the context estimates below must not count it.
+  const forwardReasoning = willForwardAssistantReasoning({
+    provider,
+    model: effectiveModel,
+    targetFormat,
+    body: body as Record<string, unknown> | null,
+    credentials,
+  });
+  // Combo per-target `weightedTargetPolicies[...].maxInputTokens`, resolved in the
+  // combo-limit block below and consumed by the final input gate.
+  let comboTargetInputPolicy: number | null = null;
   if (body && Array.isArray(allMessages) && allMessages.length > 0) {
     let estimatedTokens = estimateTokens(allMessages);
     const compressionSettingsResult = await resolveCompressionSettings(log);
@@ -2078,6 +2101,12 @@ async function handleChatCoreInner({
               (limit): limit is number =>
                 typeof limit === "number" && Number.isFinite(limit) && limit > 0
             );
+          comboTargetInputPolicy = resolveComboTargetInputPolicy({
+            comboConfig,
+            allCombos: allCombosData,
+            provider,
+            model: effectiveModel,
+          });
         }
         // chatCore executes per concrete target (handleSingleModel resolves
         // provider/effectiveModel before delegating). Compress against THIS
@@ -2120,6 +2149,18 @@ async function handleChatCoreInner({
       1,
       Math.floor((Math.max(1, contextLimit) - reservedTokens) * COMPRESSION_THRESHOLD)
     );
+
+    // Historical assistant reasoning the translator strips for this target never
+    // reaches the upstream prompt; do not let it trigger proactive compaction.
+    // Forwarded reasoning keeps the legacy chars/4 count (no new compaction churn
+    // on prefix-cache-sensitive paths).
+    if (!forwardReasoning) {
+      const strippedReasoningTokens = estimateFinalInputTokenBreakdown(
+        { messages: adaptBodyForCompression(body as Record<string, unknown>).body.messages },
+        { forwardReasoning: false }
+      ).reasoningStripped;
+      estimatedTokens = Math.max(0, estimatedTokens - strippedReasoningTokens);
+    }
 
     log?.debug?.(
       "CONTEXT",
@@ -2202,23 +2243,50 @@ async function handleChatCoreInner({
   // filtering is advisory and may preserve an all-incompatible pool; this is the
   // hard boundary that prevents a too-large prompt (or a negative token budget)
   // from reaching an OpenAI-compatible upstream such as NVIDIA NIM.
-  let finalEstimatedInputTokens = estimateFinalInputTokens(body as Record<string, unknown>);
+  // Reasoning-aware estimate: only historical reasoning the target receives is
+  // counted (forwardReasoning), at the denser reasoning chars/token ratio. The
+  // admission check adds OMNIROUTE_CONTEXT_ESTIMATE_MARGIN; the last-resort
+  // compaction trigger stays on the raw (margin-free) total.
+  const estimateFinalBreakdown = () =>
+    estimateFinalInputTokenBreakdown(body as Record<string, unknown>, {
+      forwardReasoning,
+      applyMargin: true,
+    });
+  let finalInputBreakdown = estimateFinalBreakdown();
   // Reuse the already-resolved `contextLimit` (may have been narrowed to the
   // per-target combo window above, resolveComboContextLimit) instead of a bare
   // getTokenLimit(provider, effectiveModel) re-fetch, which would silently
   // discard that combo-aware override and re-widen the last-resort budget.
   const finalContextLimit = contextLimit;
   const toolsReserve = Array.isArray(body?.tools) ? estimateTokens(body.tools) : 0;
+  const modelOutputCap = toPositiveInteger(
+    getExplicitModelOutputCap({ provider, model: effectiveModel })
+  );
+  const contextWindowChecksDisabled = areContextWindowChecksDisabled();
+  // Output room the prompt must leave: the client's requested max output when
+  // present, else OMNIROUTE_CONTEXT_OUTPUT_RESERVE_TOKENS (default 16384), clamped
+  // to the model output cap and window/4. Null when window checks are disabled.
+  const outputReserveTokens = contextWindowChecksDisabled
+    ? null
+    : resolveOutputReserveTokens(body as Record<string, unknown>, finalContextLimit, modelOutputCap);
+  // Window budget the admission check below enforces (window − output reserve).
+  const admissionWindowBudget = Math.max(1, finalContextLimit - (outputReserveTokens ?? 0));
 
   // Last-resort compaction against the concrete input budget (not the 70% threshold).
   // Covers cases where the proactive pass was skipped or still left the request oversized (#8560).
-  if (
-    reactiveContextCompactionEnabled &&
-    !nativeCodexPassthrough &&
-    finalEstimatedInputTokens >= finalContextLimit &&
-    body
-  ) {
-    const lastResortTarget = Math.max(1, finalContextLimit - toolsReserve - 1);
+  // Triggers exactly when the window check below would reject (margin-bearing
+  // estimate > window − reserve) and compacts to that same budget, so a compacted
+  // request is not then rejected on the margin/reserve it was not compacted for.
+  const finalInputOverBudget = contextWindowChecksDisabled
+    ? finalInputBreakdown.rawTotal >= finalContextLimit
+    : finalInputBreakdown.total > admissionWindowBudget;
+  if (reactiveContextCompactionEnabled && !nativeCodexPassthrough && finalInputOverBudget && body) {
+    const lastResortTarget = contextWindowChecksDisabled
+      ? Math.max(1, finalContextLimit - toolsReserve - 1)
+      : Math.max(
+          1,
+          Math.floor(admissionWindowBudget / finalInputBreakdown.margin) - toolsReserve - 1
+        );
     const lastResortAdapter = adaptBodyForCompression(body as Record<string, unknown>);
     const lastResortResult = compressContext(lastResortAdapter.body, {
       provider,
@@ -2232,42 +2300,60 @@ async function handleChatCoreInner({
             dropMissingMappedItems: true,
           })
         : lastResortResult.body;
-      finalEstimatedInputTokens = estimateFinalInputTokens(body as Record<string, unknown>);
-      const finalInputBreakdown = estimateFinalInputTokenBreakdown(
-        body as Record<string, unknown>
-      );
+      finalInputBreakdown = estimateFinalBreakdown();
       log?.info?.(
         "CONTEXT",
         `Last-resort context compaction: ${lastResortResult.stats?.original} → ${lastResortResult.stats?.final} message tokens ` +
           `(final input ${finalInputBreakdown.total}: messages=${finalInputBreakdown.messages}, ` +
           `tools=${finalInputBreakdown.tools}, system=${finalInputBreakdown.system}, ` +
-          `instructions=${finalInputBreakdown.instructions}; limit ${finalContextLimit})`
+          `instructions=${finalInputBreakdown.instructions}, reasoning=${finalInputBreakdown.reasoning}; ` +
+          `limit ${finalContextLimit})`
       );
     }
   }
+  const finalEstimatedInputTokens = finalInputBreakdown.total;
 
-  const modelOutputCap = toPositiveInteger(
-    getExplicitModelOutputCap({ provider, model: effectiveModel })
-  );
-  const contextWindowChecksDisabled = areContextWindowChecksDisabled();
+  const inputCapResolution = contextWindowChecksDisabled
+    ? null
+    : resolveInputTokenCapForGateWithSource(
+        { provider, model: effectiveModel },
+        {
+          isCombo,
+          comboTargetInputPolicy,
+          // Bound a combo policy by the target's own window minus the reserve the
+          // client actually asked for (or the default), clamped against that window.
+          outputReserveTokens: resolveOutputReserveTokens(
+            body as Record<string, unknown>,
+            Number.POSITIVE_INFINITY,
+            modelOutputCap
+          ),
+        }
+      );
+  const inputTokenCap = inputCapResolution ? toPositiveInteger(inputCapResolution.cap) : null;
   const outputBudget = enforceOutputTokenBudget(
     body as Record<string, unknown>,
     finalEstimatedInputTokens,
     contextWindowChecksDisabled ? Number.MAX_SAFE_INTEGER : finalContextLimit,
     targetFormat === FORMATS.CLAUDE && sourceFormat !== FORMATS.CLAUDE ? DEFAULT_MAX_TOKENS : 0,
     modelOutputCap,
-    contextWindowChecksDisabled
-      ? null
-      : toPositiveInteger(
-          resolveInputTokenCapForGate({ provider, model: effectiveModel }, { isCombo })
-        )
+    inputTokenCap,
+    outputReserveTokens
   );
   if (outputBudget.ok === false) {
     const exceededInputCap = outputBudget.maxInputTokens !== undefined;
+    const exceededReserve = outputBudget.outputReserveTokens !== undefined;
     const message =
       `Input exceeds ${exceededInputCap ? "maximum input tokens" : "context window"} for ${provider}/${effectiveModel}: ` +
-      `estimated ${outputBudget.estimatedInputTokens} input tokens, ${exceededInputCap ? `max input ${outputBudget.maxInputTokens}` : `limit ${outputBudget.contextLimit}`}. ` +
+      `estimated ${outputBudget.estimatedInputTokens} input tokens, ${exceededInputCap ? `max input ${outputBudget.maxInputTokens}` : `limit ${outputBudget.contextLimit}`}` +
+      `${exceededReserve ? ` minus output reserve ${outputBudget.outputReserveTokens}` : ""}. ` +
       `Reduce the prompt or route to a model with a larger ${exceededInputCap ? "input limit" : "context window"}.`;
+    log?.info?.(
+      "CONTEXT",
+      `Pre-flight rejected ${provider}/${effectiveModel}: ${formatFinalInputTokenBreakdown(finalInputBreakdown)}; ` +
+        `cap ${inputTokenCap ?? "none"} (source ${inputCapResolution?.source ?? "disabled"}), ` +
+        `context ${finalContextLimit}, output reserve ${outputReserveTokens ?? 0}, ` +
+        `forwardReasoning ${forwardReasoning}`
+    );
     log?.warn?.("CONTEXT", message);
     trackPendingRequest(model, provider, pendingConnId, false, undefined, pendingRequestId);
     return createErrorResult(
@@ -5581,6 +5667,7 @@ async function handleChatCoreInner({
           model,
           connectionId,
           reason: malformedTranslatedReason,
+          memoryInjected: injectionResult.memoryInjected,
           recvBytes: rawBytes,
           recvLines: -1,
           emitted: -1,

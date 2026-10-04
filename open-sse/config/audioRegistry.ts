@@ -32,6 +32,13 @@ export interface AudioProvider {
   format?: string;
   supportedFormats?: string[];
   async?: boolean;
+  /**
+   * When true, the provider authenticates with a connection key if one exists but
+   * proceeds unauthenticated when none is configured. Set for operator-allowlisted
+   * cluster hosts (`OMNIROUTE_LOCAL_AUDIO_HOSTS`): no credential is required, yet a
+   * configured key is still sent — which `authType: "none"` cannot express.
+   */
+  credentialsOptional?: boolean;
   models: AudioModel[];
 }
 
@@ -647,27 +654,93 @@ export interface ProviderNodeRow {
  */
 export { isLoopbackNodeHost };
 
+/** Env var naming extra hosts (e.g. in-cluster services) treated as local for audio nodes. */
+export const LOCAL_AUDIO_HOSTS_ENV = "OMNIROUTE_LOCAL_AUDIO_HOSTS";
+
+/**
+ * Parse a comma-separated host allowlist: entries are trimmed and lowercased,
+ * empty entries dropped. Each entry is a hostname or `host:port`. Exact match only.
+ */
+export function parseLocalAudioHosts(raw: string | undefined | null): Set<string> {
+  const hosts = new Set<string>();
+  if (!raw) return hosts;
+  for (const entry of raw.split(",")) {
+    const host = entry.trim().toLowerCase();
+    if (host) hosts.add(host);
+  }
+  return hosts;
+}
+
+// Kept pure (no node:/env-helper imports): this module is also bundled client-side.
+function readLocalAudioHostsEnv(): string | undefined {
+  return typeof process !== "undefined" ? process.env[LOCAL_AUDIO_HOSTS_ENV] : undefined;
+}
+
+let cachedLocalAudioHostsRaw: string | undefined | null = null;
+let cachedLocalAudioHosts: Set<string> = new Set();
+
+function getLocalAudioHosts(raw: string | undefined): Set<string> {
+  // Memoized per distinct raw value: parsed once, yet still follows env changes.
+  if (raw !== cachedLocalAudioHostsRaw) {
+    cachedLocalAudioHostsRaw = raw;
+    cachedLocalAudioHosts = parseLocalAudioHosts(raw);
+  }
+  return cachedLocalAudioHosts;
+}
+
+/**
+ * True when `baseUrl`'s host is on the `OMNIROUTE_LOCAL_AUDIO_HOSTS` allowlist.
+ * A bare-host entry matches the hostname on any port; a `host:port` entry matches
+ * only that port. URLs carrying userinfo or a non-http(s) protocol never match.
+ */
+export function isAllowlistedLocalAudioHost(
+  baseUrl: string,
+  raw: string | undefined = readLocalAudioHostsEnv()
+): boolean {
+  const hosts = getLocalAudioHosts(raw);
+  if (hosts.size === 0) return false;
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  if (url.username || url.password) return false;
+  return hosts.has(url.hostname.toLowerCase()) || hosts.has(url.host.toLowerCase());
+}
+
+/** Loopback/private hosts plus operator-allowlisted hosts (`OMNIROUTE_LOCAL_AUDIO_HOSTS`). */
+export function isLocalAudioNodeHost(baseUrl: string): boolean {
+  return isLoopbackNodeHost(baseUrl) || isAllowlistedLocalAudioHost(baseUrl);
+}
+
 /**
  * Build a dynamic AudioProvider from a provider_node DB entry.
  *
  * Loopback nodes keep `authType: "none"` — a local Ollama/LM Studio has no key and
- * must not be blocked on a missing credential. A remote node is the opposite: it is
- * only reachable when the operator opted in, and it must present the credential
- * stored on its connection, so it is built as an api-key provider keyed by the node
- * id (`credentialProviderId`) rather than by the caller-facing prefix.
+ * must not be blocked on a missing credential. Nodes on an operator-allowlisted host
+ * (`OMNIROUTE_LOCAL_AUDIO_HOSTS`) need no credential either, but still send a
+ * configured connection key, so they are api-key providers with
+ * `credentialsOptional`. Any other remote node is only reachable when the operator
+ * opted in, and it must present the credential stored on its connection, so it is
+ * built as an api-key provider keyed by the node id (`credentialProviderId`) rather
+ * than by the caller-facing prefix.
  */
 export function buildDynamicAudioProvider(node: ProviderNodeRow, audioPath: string): AudioProvider {
   if (!node.prefix || !node.baseUrl) {
     throw new Error(`Invalid provider_node: missing prefix or baseUrl`);
   }
   const baseUrl = node.baseUrl.replace(/\/+$/, "");
-  const isLocal = isLoopbackNodeHost(node.baseUrl);
+  const isLoopback = isLoopbackNodeHost(node.baseUrl);
+  const isAllowlisted = !isLoopback && isAllowlistedLocalAudioHost(node.baseUrl);
   return {
     id: node.prefix,
     ...(node.id ? { credentialProviderId: node.id } : {}),
     baseUrl: `${baseUrl}${audioPath}`,
-    authType: isLocal ? "none" : "apikey",
-    authHeader: isLocal ? "none" : "bearer",
+    authType: isLoopback ? "none" : "apikey",
+    authHeader: isLoopback ? "none" : "bearer",
+    ...(isAllowlisted ? { credentialsOptional: true } : {}),
     models: [],
   };
 }

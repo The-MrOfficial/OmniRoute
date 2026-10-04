@@ -10,7 +10,9 @@ import { errorResponseWithComboDiagnostics } from "../utils/error.ts";
 import { recordComboFailure } from "./combo/failureTracker.ts";
 import { buildRecoveryHint } from "./combo/pinRecovery.ts";
 import { buildTargetTimeoutRunner } from "./combo/targetTimeoutRunner.ts";
-import { getComboMetrics } from "./comboMetrics.ts";
+import { getComboMetrics, recordComboRequest } from "./comboMetrics.ts";
+import { applyTierCeilingToCombo, resolveComboTierCeiling } from "./combo/tierCeiling.ts";
+import { normalizeRoutingStrategy } from "../../src/shared/constants/routingStrategies.ts";
 import { qualityScoreFor } from "./routing/index.ts";
 import {
   resolveComboQueueDepth,
@@ -657,6 +659,60 @@ async function handleComboChatInner({
   requestHeaders = null,
   invocationId,
 }: HandleComboChatOptions): Promise<Response> {
+  // Per-request X-OmniRoute-Tier ceiling for non-auto strategies. `auto` already
+  // applies the ceiling inside the auto engine (FEAT-005) by model classification.
+  // Absent/invalid header => no ceiling (config.tierRouting.defaultTier is NOT applied).
+  // Filtering combo.models here, before createComboContext, covers every downstream
+  // path (pinned, runtime-unit execute, flatten target pipeline, round-robin, ...).
+  // The ceiling re-applies at each nesting level because nested combo-ref execution
+  // re-enters handleComboChat via buildBaseOptions (relayOptions/requestHeaders);
+  // pool/tierN/* combos hold untiered model steps, so the outer step is the gate.
+  const rawStrategy = normalizeRoutingStrategy(combo.strategy || "priority");
+  if (rawStrategy !== "auto") {
+    const tierCeiling = resolveComboTierCeiling({
+      relayOptions,
+      requestHeaders,
+      config: combo.config,
+    });
+    if (tierCeiling) {
+      const filtered = applyTierCeilingToCombo(combo, tierCeiling.ceiling, allCombos);
+      if (filtered.excluded.length > 0) {
+        log.debug(
+          "COMBO",
+          `tier ceiling ${tierCeiling.ceiling} (header ${tierCeiling.headerTier}, maximumTier ${
+            tierCeiling.maximumTier ?? "—"
+          }) excluded steps: ${filtered.excluded
+            .map((e) => `${e.stepId}(tier ${e.tier})`)
+            .join(", ")}`
+        );
+      }
+      if (filtered.originalCount > 0 && filtered.combo.models.length === 0) {
+        recordComboRequest(combo.name, null, {
+          success: false,
+          latencyMs: 0,
+          fallbackCount: 0,
+          strategy: rawStrategy,
+        });
+        return errorResponseWithComboDiagnostics(
+          503,
+          `No target within tier ${tierCeiling.ceiling} available for combo ${combo.name}`,
+          {
+            poolSize: filtered.originalCount,
+            attempted: 0,
+            excluded: filtered.excluded.map((e) => ({
+              provider: "tier-ceiling",
+              model: e.stepId,
+              reason: `tier_${e.tier}_above_ceiling_${tierCeiling.ceiling}`,
+            })),
+            attemptOrder: [],
+            terminalReason: "tier_ceiling_no_targets",
+          },
+          { code: "tier_ceiling_unavailable" }
+        );
+      }
+      combo = filtered.combo;
+    }
+  }
   const comboCtx = createComboContext({ body, combo, settings, relayOptions, log });
   const {
     strategy,

@@ -83,6 +83,7 @@ async function postHandler(request, context) {
     apiKeyId: apiKeyMeta?.id || null,
     apiKeyName: apiKeyMeta?.name || null,
     connectionId: null,
+    signal: request.signal ?? null,
   });
 }
 

@@ -23,6 +23,8 @@ import {
 import { getProviderByAlias, getProviderById } from "../../../src/shared/constants/providers.ts";
 import { estimateTokens } from "../contextManager.ts";
 import { containsMediaKind } from "../../utils/mediaParts.ts";
+import { splitAssistantReasoning } from "../../utils/assistantReasoning.ts";
+import { getContextEstimateMargin } from "../../handlers/chatCore/contextEstimateConfig.ts";
 import { getResolvedModelCapabilities } from "../modelCapabilities.ts";
 import { parseModel, stripContextWindowSuffix } from "../model.ts";
 import { dedupeTargetsByExecutionKey, isRecord } from "./comboData.ts";
@@ -497,12 +499,21 @@ export function hasEstimableContent(value: unknown): boolean {
   return true;
 }
 
+// Advisory compat-filter estimate. Historical assistant reasoning is excluded:
+// per-target forwarding is not known at this layer, and most OpenAI-format
+// targets have it stripped by the translator. The final chatCore gate counts
+// forwarded reasoning per target and stays authoritative. The same safety
+// margin as the gate (OMNIROUTE_CONTEXT_ESTIMATE_MARGIN) is applied.
 function estimateRequestInputTokens(body: Record<string, unknown>): number {
   const estimatePayload: Record<string, unknown> = {};
   for (const key of ["messages", "input", "tools", "functions", "response_format"]) {
-    if (hasEstimableContent(body[key])) estimatePayload[key] = body[key];
+    if (hasEstimableContent(body[key])) {
+      estimatePayload[key] =
+        key === "messages" ? splitAssistantReasoning(body[key]).messages : body[key];
+    }
   }
-  return Object.keys(estimatePayload).length > 0 ? estimateTokens(estimatePayload) : 0;
+  if (Object.keys(estimatePayload).length === 0) return 0;
+  return Math.ceil(estimateTokens(estimatePayload) * getContextEstimateMargin());
 }
 
 function valueContainsImagePart(value: unknown): boolean {

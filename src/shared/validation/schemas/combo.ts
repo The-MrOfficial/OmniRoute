@@ -21,6 +21,9 @@ export const comboStepMetaSchema = {
   weight: z.number().min(0).max(100).optional().default(0),
   label: z.string().trim().min(1).max(200).optional(),
   fallbackOnlyOnQuotaExhaustion: z.boolean().optional(),
+  // Explicit cost tier for the per-request X-OmniRoute-Tier ceiling (non-auto combos).
+  // Absent = derived from the referenced combo name (pool/tierN/...) or step id (-tierN).
+  tier: z.number().int().min(1).max(5).optional(),
 };
 
 export const comboModelStepInputSchema = z.object({

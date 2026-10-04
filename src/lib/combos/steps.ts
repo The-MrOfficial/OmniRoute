@@ -26,6 +26,8 @@ export interface ComboModelStep {
   prompt?: string | null;
   tags?: string[];
   fallbackOnlyOnQuotaExhaustion?: boolean;
+  /** Explicit cost tier (1-5) for the per-request `X-OmniRoute-Tier` ceiling. */
+  tier?: number;
 }
 
 export interface ComboRefStep {
@@ -35,6 +37,8 @@ export interface ComboRefStep {
   weight: number;
   label?: string;
   fallbackOnlyOnQuotaExhaustion?: boolean;
+  /** Explicit cost tier (1-5) for the per-request `X-OmniRoute-Tier` ceiling. */
+  tier?: number;
 }
 
 export interface ComboProviderWildcardStep {
@@ -46,6 +50,8 @@ export interface ComboProviderWildcardStep {
   allowedConnectionIds?: string[] | null;
   weight: number;
   label?: string;
+  /** Explicit cost tier (1-5) for the per-request `X-OmniRoute-Tier` ceiling. */
+  tier?: number;
 }
 
 export type ComboStep = ComboModelStep | ComboRefStep | ComboProviderWildcardStep;
@@ -85,6 +91,13 @@ function toWeight(value: unknown): number {
 
   if (!Number.isFinite(parsed)) return 0;
   return Math.max(0, Math.min(100, parsed));
+}
+
+/** Explicit step tier: an integer 1-5, otherwise undefined (step stays untiered). */
+function toTier(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 5
+    ? value
+    : undefined;
 }
 
 function collectComboNames(allCombos: ComboCollectionLike): Set<string> {
@@ -319,6 +332,8 @@ export function normalizeComboStep(
   const label = toTrimmedString(value.label);
   const prompt = toTrimmedString(value.prompt);
   const fallbackOnlyOnQuotaExhaustion = value.fallbackOnlyOnQuotaExhaustion === true;
+  const tier = toTier(value.tier);
+  const tierField = tier !== undefined ? { tier } : {};
 
   if (value.kind === "combo-ref") {
     const comboRefName = toTrimmedString(value.comboName);
@@ -330,6 +345,7 @@ export function normalizeComboStep(
       weight,
       ...(label ? { label } : {}),
       ...(fallbackOnlyOnQuotaExhaustion ? { fallbackOnlyOnQuotaExhaustion: true } : {}),
+      ...tierField,
     };
   }
 
@@ -365,6 +381,7 @@ export function normalizeComboStep(
       weight,
       ...(label ? { label } : {}),
       ...(allowedConnectionIds && allowedConnectionIds.length > 0 ? { allowedConnectionIds } : {}),
+      ...tierField,
     };
   }
 
@@ -404,6 +421,7 @@ export function normalizeComboStep(
       weight,
       ...(label ? { label } : {}),
       ...(allowedConnectionIds && allowedConnectionIds.length > 0 ? { allowedConnectionIds } : {}),
+      ...tierField,
     };
   }
 
@@ -414,6 +432,7 @@ export function normalizeComboStep(
       comboName: rawModel,
       weight,
       ...(label ? { label } : {}),
+      ...tierField,
     };
   }
 
@@ -443,6 +462,7 @@ export function normalizeComboStep(
     ...(tags && tags.length > 0 ? { tags } : {}),
     ...(allowedConnectionIds && allowedConnectionIds.length > 0 ? { allowedConnectionIds } : {}),
     ...(fallbackOnlyOnQuotaExhaustion ? { fallbackOnlyOnQuotaExhaustion: true } : {}),
+    ...tierField,
   };
 }
 

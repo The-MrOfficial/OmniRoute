@@ -9,6 +9,7 @@ import {
   resolveRequestModePack,
   parseRequestBudgetCap,
   parseRequestBudgetFallback,
+  resolveRequestTier,
 } from "../autoCombo/requestControls.ts";
 import { selectWithStrategy } from "../autoCombo/routerStrategy.ts";
 import { buildComplexityRoutingHint } from "../autoCombo/complexityRouter";
@@ -74,6 +75,8 @@ export interface ResolveAutoStrategyDeps {
     budgetCap?: number | null;
     /** Per-request X-OmniRoute-Budget-Fallback value ("cheapest" | "strict") — #3470. */
     budgetFallback?: "cheapest" | "strict" | null;
+    /** Per-request X-OmniRoute-Tier cost-tier ceiling (1-5) — #FEAT-005. */
+    tierCeiling?: number | null;
   } | null;
   resilienceSettings: ResilienceSettings;
   log: ComboLogger;
@@ -267,6 +270,9 @@ export async function resolveAutoStrategyOrder(
   const budgetFallback = requestBudgetFallback ?? configBudgetFallback;
   const requestModePack = resolveRequestModePack(relayOptions?.mode);
   const modePack = requestModePack.override ? requestModePack.modePack : configModePack;
+  // Per-request cost-tier ceiling (#FEAT-005): admit only candidates within the
+  // requested tier band. Absent/garbage header => undefined => no ceiling applied.
+  const tierCeiling = resolveRequestTier(relayOptions?.tierCeiling);
   // #7008: `weights` must track the *effective* (post-override) modePack, not just
   // the combo's stored one. `selectAutoProvider()` (engine.ts) already re-derives
   // weights internally from the `modePack` it's given, so it correctly reacts to a
@@ -281,13 +287,14 @@ export async function resolveAutoStrategyOrder(
   if (
     requestModePack.override ||
     requestBudgetCap !== undefined ||
-    requestBudgetFallback !== undefined
+    requestBudgetFallback !== undefined ||
+    tierCeiling !== undefined
   ) {
     log.debug?.(
       "COMBO",
       `Auto strategy: per-request controls applied (mode=${
         requestModePack.override ? (requestModePack.modePack ?? "balanced") : "—"
-      }, budgetCap=${requestBudgetCap ?? "—"}, budgetFallback=${requestBudgetFallback ?? "—"})`
+      }, budgetCap=${requestBudgetCap ?? "—"}, budgetFallback=${requestBudgetFallback ?? "—"}, tier=${tierCeiling ?? "—"})`
     );
   }
 
@@ -408,6 +415,7 @@ export async function resolveAutoStrategyOrder(
             modePack,
             budgetCap,
             budgetFallback,
+            ...(tierCeiling !== undefined ? { tierCeiling } : {}),
             estimatedInputTokens,
             explorationRate,
           },

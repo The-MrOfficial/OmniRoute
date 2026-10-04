@@ -112,6 +112,14 @@ function validateCacheBlock(data: Record<string, unknown>, ctx: z.RefinementCtx)
       path: ["cache", "supportsPromptCaching"],
     });
   }
+  const prefixCacheSensitive = cacheRecord.prefixCacheSensitive;
+  if (prefixCacheSensitive !== undefined && typeof prefixCacheSensitive !== "boolean") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "providerSpecificData.cache.prefixCacheSensitive must be a boolean",
+      path: ["cache", "prefixCacheSensitive"],
+    });
+  }
   const cacheControlPassthrough = cacheRecord.cacheControlPassthrough;
   if (
     cacheControlPassthrough !== undefined &&

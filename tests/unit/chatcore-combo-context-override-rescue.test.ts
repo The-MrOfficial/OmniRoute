@@ -38,8 +38,9 @@ const { handleChatCore } = await import("../../open-sse/handlers/chatCore.ts");
 const PROVIDER = "github";
 const MODEL = "claude-opus-4.5";
 const CONTEXT_OVERRIDE = 1_000_000;
-// ~3.7M chars ≈ 925k estimated tokens — above the catalog input hint, below the override.
-const BIG_PROMPT = "x".repeat(3_700_000);
+// ~3.3M chars ≈ 825k estimated tokens (≈908k after the ×1.10 admission margin) —
+// above the catalog input hint, below the override.
+const BIG_PROMPT = "x".repeat(3_300_000);
 
 const originalFetch = globalThis.fetch;
 let fetchCalls = 0;

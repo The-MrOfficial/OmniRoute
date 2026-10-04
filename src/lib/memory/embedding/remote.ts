@@ -2,115 +2,102 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 import { createEmbeddingResponse } from "@/lib/embeddings/service";
 import type { EmbeddingResult, EmbeddingError } from "./types";
 import type { ResolvedMemoryCustomEmbeddingProvider } from "./customProvider";
+import { embedTextChunked } from "./chunking";
 
+/**
+ * Embed one memory text through OmniRoute's own /v1/embeddings path.
+ *
+ * Long texts (e.g. a post-condense `## Conversation Summary` retrieval query)
+ * are split into ≤12k-char chunks, embedded one request per chunk, and
+ * mean-pooled into one vector; see chunking.ts for the rationale. Requests are
+ * flagged `internalCaller` so the per-item token cap truncates instead of
+ * rejecting. No retries happen here: the first failing chunk's error is
+ * returned and the remaining chunks are not sent.
+ */
 export async function embedRemote(
   text: string,
   model: string,
-  customProvider: ResolvedMemoryCustomEmbeddingProvider | null = null
+  customProvider: ResolvedMemoryCustomEmbeddingProvider | null = null,
+  requestFn: typeof createEmbeddingResponse = createEmbeddingResponse
 ): Promise<EmbeddingResult | EmbeddingError> {
   const t0 = Date.now();
+  const requestOptions = {
+    internalCaller: true,
+    ...(customProvider
+      ? { resolvedProvider: customProvider.provider, resolvedModel: customProvider.model }
+      : {}),
+  };
+  const fail = (
+    reason: EmbeddingError["reason"],
+    message: string,
+    status?: number
+  ): EmbeddingError => ({
+    source: "remote",
+    model,
+    reason,
+    message: sanitizeErrorMessage(message),
+    ...(status !== undefined ? { status } : {}),
+  });
 
-  // Embedding models cap `input` at 8192 tokens (text-embedding-3-small).
-  // The memory-retrieval query is built from conversation context and can
-  // exceed that on long sessions → upstream HTTP 400
-  // "Invalid 'input': maximum context length is 8192 tokens", which fails the
-  // whole retrieval call. Clip conservatively (~20k chars stays under 8192
-  // tokens even for code/CJK-heavy text) — a truncated query keeps recall
-  // working; an unclipped one guarantees a 400.
-  const MAX_EMBED_CHARS = 20_000;
-  const clippedInput = text.length > MAX_EMBED_CHARS ? text.slice(0, MAX_EMBED_CHARS) : text;
-  let resp: Response;
-  try {
-    resp = await createEmbeddingResponse(
-      { model, input: clippedInput },
-      customProvider
-        ? {
-            resolvedProvider: customProvider.provider,
-            resolvedModel: customProvider.model,
-          }
-        : undefined
-    );
-  } catch (err: unknown) {
-    // Network-level errors (ECONNREFUSED, AbortError, etc.)
-    const isTimeout =
-      err instanceof Error &&
-      (err.name === "AbortError" || err.message.toLowerCase().includes("timeout"));
-    return {
-      source: "remote",
-      model,
-      reason: isTimeout ? "timeout" : "request_failed",
-      message: sanitizeErrorMessage(err instanceof Error ? err.message : String(err)),
-    };
-  }
-
-  if (!resp.ok) {
-    const status = resp.status;
-    if (status === 401 || status === 403) {
-      return {
-        source: "remote",
-        model,
-        reason: "no_key",
-        message: sanitizeErrorMessage(`Embedding provider returned ${status}`),
-      };
+  const embedOne = async (chunk: string): Promise<Float32Array | EmbeddingError> => {
+    let resp: Response;
+    try {
+      resp = await requestFn({ model, input: chunk }, requestOptions);
+    } catch (err: unknown) {
+      // Network-level errors (ECONNREFUSED, AbortError, etc.)
+      const isTimeout =
+        err instanceof Error &&
+        (err.name === "AbortError" || err.message.toLowerCase().includes("timeout"));
+      return fail(
+        isTimeout ? "timeout" : "request_failed",
+        err instanceof Error ? err.message : String(err)
+      );
     }
-    if (status === 429) {
-      return {
-        source: "remote",
-        model,
-        reason: "rate_limited",
-        message: sanitizeErrorMessage(`Embedding provider returned 429 (rate limited)`),
-      };
+    if (!resp.ok) {
+      const status = resp.status;
+      if (status === 401 || status === 403) {
+        return fail("no_key", `Embedding provider returned ${status}`, status);
+      }
+      if (status === 429) {
+        return fail("rate_limited", `Embedding provider returned 429 (rate limited)`, status);
+      }
+      return fail("request_failed", `Embedding provider returned HTTP ${status}`, status);
     }
-    return {
-      source: "remote",
-      model,
-      reason: "request_failed",
-      message: sanitizeErrorMessage(`Embedding provider returned HTTP ${status}`),
-    };
-  }
-
-  let json: unknown;
-  try {
-    json = await resp.json();
-  } catch (err: unknown) {
-    return {
-      source: "remote",
-      model,
-      reason: "request_failed",
-      message: sanitizeErrorMessage(
+    let json: unknown;
+    try {
+      json = await resp.json();
+    } catch (err: unknown) {
+      return fail(
+        "request_failed",
         err instanceof Error ? err.message : "Failed to parse embedding response"
-      ),
-    };
-  }
-
-  try {
-    const data = (json as { data?: Array<{ embedding: number[] }> }).data;
-    if (!Array.isArray(data) || data.length === 0 || !Array.isArray(data[0].embedding)) {
-      return {
-        source: "remote",
-        model,
-        reason: "request_failed",
-        message: sanitizeErrorMessage(
-          "Unexpected embedding response shape: missing data[0].embedding"
-        ),
-      };
+      );
     }
-    const rawVec = data[0].embedding as number[];
-    const vector = new Float32Array(rawVec);
-    return {
-      vector,
-      source: "remote",
-      model,
-      dimensions: vector.length,
-      latencyMs: Date.now() - t0,
-      cached: false,
-    };
-  } catch (err: unknown) {
-    return {
-      source: "remote",
-      model,
-      reason: "request_failed",
-      message: sanitizeErrorMessage(err instanceof Error ? err.message : "Embedding parse error"),
-    };
-  }
+    try {
+      const data = (json as { data?: Array<{ embedding: number[] }> }).data;
+      if (!Array.isArray(data) || data.length === 0 || !Array.isArray(data[0].embedding)) {
+        return fail(
+          "request_failed",
+          "Unexpected embedding response shape: missing data[0].embedding"
+        );
+      }
+      return new Float32Array(data[0].embedding);
+    } catch (err: unknown) {
+      return fail("request_failed", err instanceof Error ? err.message : "Embedding parse error");
+    }
+  };
+
+  const result = await embedTextChunked(
+    text,
+    embedOne,
+    (value): value is Float32Array => value instanceof Float32Array
+  );
+  if (!(result instanceof Float32Array)) return result;
+  return {
+    vector: result,
+    source: "remote",
+    model,
+    dimensions: result.length,
+    latencyMs: Date.now() - t0,
+    cached: false,
+  };
 }

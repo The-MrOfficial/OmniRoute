@@ -492,3 +492,57 @@ test("reportMalformed200 runs without throwing", () => {
     })
   );
 });
+
+// FEAT-004 (Failure A observability): the empty-output 502 diagnostic line must
+// record BOTH the provider id and whether gateway-side memory text was injected
+// on the request, so a future recurrence self-classifies the A<->C question
+// (empty-502 vs memory injection corrupting the request) without re-reading
+// call logs. Capture console.log to assert the emitted line.
+function captureReportMalformed200(opts: Parameters<typeof reportMalformed200>[0]): string {
+  const originalLog = console.log;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map((a) => (typeof a === "string" ? a : String(a))).join(" "));
+  };
+  try {
+    reportMalformed200(opts);
+  } finally {
+    console.log = originalLog;
+  }
+  return lines.join("\n");
+}
+
+test("reportMalformed200 records provider id and mem=true when memory was injected", () => {
+  const line = captureReportMalformed200({
+    mode: "nonstream",
+    provider: "vllm",
+    model: "qwen3.5-9b-nvfp4-reader",
+    reason: "empty_choices",
+    memoryInjected: true,
+  });
+  assert.match(line, /\[MALFORMED-200\]/);
+  assert.match(line, /provider=vllm/);
+  assert.match(line, /mem=true/);
+});
+
+test("reportMalformed200 records mem=false when an owner was present but nothing was injected", () => {
+  const line = captureReportMalformed200({
+    mode: "nonstream",
+    provider: "bedrock",
+    model: "claude-opus-5",
+    reason: "empty_choices",
+    memoryInjected: false,
+  });
+  assert.match(line, /provider=bedrock/);
+  assert.match(line, /mem=false/);
+});
+
+test("reportMalformed200 records mem=? when the injection state is not supplied", () => {
+  const line = captureReportMalformed200({
+    mode: "nonstream",
+    provider: "huggingface",
+    model: "m",
+    reason: "empty_choices",
+  });
+  assert.match(line, /mem=\?/);
+});

@@ -307,8 +307,9 @@ test("input-only maxInputTokens is not double-counted against the output reserve
   //   maxInputTokens >= estimatedInputTokens + 32_000
   // i.e. it allowed only ~240K of input against a real 272K input cap — the
   // output reserve was double-counted against an already input-only cap. Here
-  // the input (~256K tokens) sits between the buggy allowance (240K) and the
-  // real cap (272K): the fix keeps the target, the bug drops it.
+  // the input (240K raw, ~264K after the ×1.10 estimate margin) sits between the
+  // buggy allowance (272K − 32K) and the real cap (272K): the fix keeps the
+  // target, the bug drops it.
   saveModelsDevCapabilities({
     "unit-7039": {
       "codex-like": capabilityEntryWithLimits(272_000, 400_000, 128_000),
@@ -318,7 +319,7 @@ test("input-only maxInputTokens is not double-counted against the output reserve
 
   const out = filterTargetsByRequestCompatibility(
     [target("unit-7039/codex-like"), target("unit-7039/huge")],
-    { ...bigContextBody(256_000), max_tokens: 32_000 },
+    { ...bigContextBody(240_000), max_tokens: 32_000 },
     noopLog
   );
 

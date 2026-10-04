@@ -22,6 +22,10 @@ import { connectionCircuitBreakerName } from "../connectionCircuitBreaker.ts";
 import { parseModel } from "../model.ts";
 import { canAffordRequest } from "../../../src/lib/quota/quotaScheduler.ts";
 import { getCachedProviderConnectionById } from "../../../src/lib/db/readCache.ts";
+import {
+  isPrefixCacheSensitive,
+  resolveConnectionCacheOverride,
+} from "../../utils/cacheControlPolicy.ts";
 import { lookupPositiveCap } from "./concurrencyCaps.ts";
 import { recordComboDecision } from "./decisionTrace.ts";
 import { recordPersistedSkipBypass } from "../comboMetrics.ts";
@@ -96,6 +100,29 @@ export async function readConnectionForCooldownGate(
   if (!fresh) return getCachedProviderConnectionById(connectionId);
   const { getProviderConnectionById } = await import("@/lib/db/providers");
   return (await getProviderConnectionById(connectionId)) as Record<string, unknown> | null;
+}
+
+/**
+ * True when a combo target routes to a KV-prefix-cache-sensitive backend
+ * (llama-cpp by default, or a connection `cache.prefixCacheSensitive`
+ * override). Any request rewrite there forces a full re-prefill, so callers
+ * skip optional compression. The connection is read only when the target has
+ * a connectionId; a failed read counts as no override.
+ */
+export async function isPrefixCacheSensitiveTarget(target: {
+  provider?: string | null;
+  connectionId?: string | null;
+}): Promise<boolean> {
+  let override: ReturnType<typeof resolveConnectionCacheOverride> = null;
+  if (target.connectionId) {
+    try {
+      const connection = await readConnectionForCooldownGate(target.connectionId, false);
+      override = resolveConnectionCacheOverride(connection?.providerSpecificData);
+    } catch {
+      override = null;
+    }
+  }
+  return isPrefixCacheSensitive(target.provider, override);
 }
 
 export async function evaluateExecuteTargetGates(opts: {

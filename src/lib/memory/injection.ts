@@ -21,7 +21,14 @@ const log = logger("MEMORY_INJECTION");
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
-  content: string;
+  /**
+   * Typed `string` for the common OpenAI case, but the real wire shape can be
+   * an array of content blocks (`[{ type: "text", text: "..." }, ...]`) — the
+   * Roo/Zoo OpenAI-format client sends the orchestrator system prompt that way.
+   * Widened so the compiler forces callers to handle the array case rather than
+   * silently coercing it to `"[object Object]"` via string interpolation.
+   */
+  content: string | Array<{ type: string; text?: string; [key: string]: unknown }>;
   name?: string;
 }
 
@@ -81,8 +88,25 @@ export function providerSupportsSystemMessage(provider: string | null | undefine
  * case-insensitive) — e.g. a custom OpenAI-compatible connection in front of a
  * self-hosted Qwen3.5+/3.6 model, whose chat template enforces the same
  * single-leading-system-message constraint as xiaomi-mimo.
+ *
+ * `vllm`, `ollama-local`, `ollama`, `llama-cpp`, `llamacpp` are the self-hosted
+ * strict Qwen/GLM chat-template providers (esnixi 5090 coder, 4070 IQ3 coder,
+ * M5 MLX/GLM) added per Failure C. Their chat templates reject a system-role
+ * message at any index > 0, so the #3890 cache-safe mid-array splice would
+ * otherwise push the real system message off index 0 and trigger
+ * "System message must be at the beginning" (HTTP 400/500). Both the hyphenated
+ * and unhyphenated llama.cpp spellings observed in /v1/models are covered.
  */
-const BUILTIN_PROVIDERS_SYSTEM_MUST_BE_FIRST = new Set(["xiaomi-mimo", "mimo", "tokenrouter"]);
+const BUILTIN_PROVIDERS_SYSTEM_MUST_BE_FIRST = new Set([
+  "xiaomi-mimo",
+  "mimo",
+  "tokenrouter",
+  "vllm",
+  "ollama-local",
+  "ollama",
+  "llama-cpp",
+  "llamacpp",
+]);
 
 /**
  * Parses OMNIROUTE_STRICT_SYSTEM_PROVIDERS into a normalized id list.
@@ -153,6 +177,25 @@ export interface InjectMemoryOptions {
 }
 
 /**
+ * Flatten any non-string content-block value to text, mirroring
+ * strictSystemHoist's `toTextContent()`. Never falls back to bare `String()`,
+ * which would regenerate `"[object Object]"` for an array/object value.
+ */
+function toText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(
+        (part): part is { type: string; text?: unknown } =>
+          Boolean(part) && typeof part === "object" && (part as { type?: unknown }).type === "text"
+      )
+      .map((part) => String(part.text ?? ""))
+      .join("\n");
+  }
+  return "";
+}
+
+/**
  * #6135: place the memory as a leading system message for providers that reject
  * a non-first system role — merging into an existing index-0 system message when
  * present, else prepending. Split out of injectMemory to keep it flat.
@@ -166,7 +209,30 @@ function injectSystemFirst(
   log.info("memory.injection.injected", { count, strategy: "system-first", model: request.model });
   const first = messages[0];
   if (first && first.role === "system") {
-    const merged: ChatMessage = { ...first, content: `${memoryText}\n${first.content}` };
+    // Shape-aware merge: the Roo/Zoo OpenAI-format client sends messages[0].content
+    // as an ARRAY of content blocks. Blindly interpolating it (`${first.content}`)
+    // coerces the array to `"[object Object]"`, discarding a 54K orchestrator prompt
+    // (findings §Q5). Prepend the memory as a leading text block for arrays, keep
+    // string concatenation for the common string case, and flatten any other shape
+    // via toText() rather than bare String().
+    let mergedContent: ChatMessage["content"];
+    if (typeof first.content === "string") {
+      mergedContent = `${memoryText}\n${first.content}`;
+    } else if (Array.isArray(first.content)) {
+      // Merge into the leading text block instead of adding a block: Ollama's
+      // OpenAI shim expands each system text block into its own system message,
+      // so an extra block puts a second system message at index 1 and the strict
+      // Qwen template raises "System message must be at the beginning" (HTTP 500).
+      const [lead, ...rest] = first.content;
+      if (lead && lead.type === "text" && typeof lead.text === "string") {
+        mergedContent = [{ ...lead, text: `${memoryText}\n${lead.text}` }, ...rest];
+      } else {
+        mergedContent = [{ type: "text", text: memoryText }, ...first.content];
+      }
+    } else {
+      mergedContent = `${memoryText}\n${toText(first.content)}`;
+    }
+    const merged: ChatMessage = { ...first, content: mergedContent };
     return { ...request, messages: [merged, ...messages.slice(1)] };
   }
   // #13425: Anthropic-shaped bodies carry the system prompt in the top-level

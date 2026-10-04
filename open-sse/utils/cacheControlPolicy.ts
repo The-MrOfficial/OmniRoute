@@ -142,6 +142,35 @@ const OPENAI_FORMAT_CACHE_CONTROL_PROVIDERS = new Set([
 export interface ConnectionCacheOverride {
   supportsPromptCaching?: boolean;
   cacheControlPassthrough?: "strip" | "openai-format" | "claude-format";
+  /**
+   * The upstream reuses its live KV cache only when the new prompt extends the
+   * previous one byte-for-byte, so already-sent history must never be rewritten
+   * (see `isPrefixCacheSensitive`). Overrides the built-in provider default.
+   */
+  prefixCacheSensitive?: boolean;
+}
+
+/**
+ * Providers whose upstream keeps a single live KV cache that cannot be rolled
+ * back to an arbitrary earlier position (e.g. ds4 serving GLM-5.3, whose KDA
+ * linear-attention layers carry recurrent state). Any rewrite of already-sent
+ * history forces a full re-prefill from token 0, so OmniRoute must forward
+ * history verbatim: no per-turn tool-result truncation and no stripping of
+ * replayed `reasoning_content`. Other self-hosted backends (vLLM APC, Ollama)
+ * can truncate to the divergence point and only opt in per connection via
+ * `providerSpecificData.cache.prefixCacheSensitive: true`.
+ */
+const PREFIX_CACHE_SENSITIVE_PROVIDERS = new Set(["llama-cpp", "llamacpp"]);
+
+export function isPrefixCacheSensitive(
+  provider: string | null | undefined,
+  connectionCacheOverride?: ConnectionCacheOverride | null
+): boolean {
+  if (typeof connectionCacheOverride?.prefixCacheSensitive === "boolean") {
+    return connectionCacheOverride.prefixCacheSensitive;
+  }
+  if (!provider) return false;
+  return PREFIX_CACHE_SENSITIVE_PROVIDERS.has(provider.toLowerCase().trim());
 }
 
 /**
@@ -166,6 +195,9 @@ export function resolveConnectionCacheOverride(
     record.cacheControlPassthrough === "claude-format"
   ) {
     result.cacheControlPassthrough = record.cacheControlPassthrough;
+  }
+  if (typeof record.prefixCacheSensitive === "boolean") {
+    result.prefixCacheSensitive = record.prefixCacheSensitive;
   }
   return Object.keys(result).length > 0 ? result : null;
 }

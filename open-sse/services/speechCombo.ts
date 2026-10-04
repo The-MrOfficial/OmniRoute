@@ -100,18 +100,22 @@ export async function executeSpeechCombo(
       try {
         credentials = await getProviderCredentialsWithQuotaPreflight(credentialKey);
       } catch {
-        lastError = { status: 502, error: `Failed to resolve credentials for ${targetProvider}` };
-        fallbackCount += 1;
-        continue;
+        if (!providerConfig.credentialsOptional) {
+          lastError = { status: 502, error: `Failed to resolve credentials for ${targetProvider}` };
+          fallbackCount += 1;
+          continue;
+        }
+        // Allowlisted local hosts proceed unauthenticated when the lookup fails.
+        credentials = null;
       }
 
-      if (!credentials) {
+      if (!credentials && !providerConfig.credentialsOptional) {
         lastError = { status: 400, error: `No credentials for provider: ${targetProvider}` };
         fallbackCount += 1;
         continue;
       }
 
-      if (isAllRateLimitedCredentials(credentials)) {
+      if (credentials && isAllRateLimitedCredentials(credentials)) {
         lastError = { status: 429, error: `[${targetProvider}] All accounts rate limited` };
         fallbackCount += 1;
         continue;

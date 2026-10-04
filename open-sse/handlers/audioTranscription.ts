@@ -911,7 +911,7 @@ export async function handleAudioTranscription({
   // Skip credential check for local providers (authType: "none")
   const token =
     providerConfig.authType === "none" ? null : credentials?.apiKey || credentials?.accessToken;
-  if (providerConfig.authType !== "none" && !token) {
+  if (providerConfig.authType !== "none" && !providerConfig.credentialsOptional && !token) {
     return errorResponse(401, `No credentials for transcription provider: ${providerConfig.id}`);
   }
 

@@ -364,6 +364,15 @@ test("memory actual injection → builtinToolNames equals exactly the newly adde
     "builtinToolNames must equal exactly the newly added memory tool names"
   );
 
+  // FEAT-004 observability: injecting memory *tools* does not inject memory
+  // *text*, so with no stored memories for this owner memoryInjected stays
+  // false — this is the signal the empty-output 502 diagnostic records.
+  assert.strictEqual(
+    (result as Record<string, unknown>).memoryInjected,
+    false,
+    "memoryInjected must be false when only memory tools (not memory text) were added"
+  );
+
   resetSkillsRegistry();
   inv3();
 });

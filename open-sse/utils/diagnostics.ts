@@ -42,6 +42,13 @@ export interface ReportMalformed200Opts {
   events?: Record<string, number>;
   ttftMs?: number;
   elapsedMs?: number;
+  // Whether gateway-side memory text was injected into this request before it
+  // was sent upstream. Recorded on the empty-output 502 line so a future
+  // occurrence self-classifies the A<->C question (empty-502 vs memory
+  // injection corrupting the request) without re-reading call logs. `null`
+  // means "not reported" (e.g. no owner / caller did not pass it); it is
+  // distinct from an explicit `false` ("owner present, nothing injected").
+  memoryInjected?: boolean | null;
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -86,6 +93,7 @@ export function reportMalformed200(opts: ReportMalformed200Opts): void {
     events,
     ttftMs,
     elapsedMs,
+    memoryInjected,
   } = opts;
   const evtStr =
     events && typeof events === "object"
@@ -93,9 +101,13 @@ export function reportMalformed200(opts: ReportMalformed200Opts): void {
           .map(([k, v]) => `${k}=${v}`)
           .join(",")}]`
       : "[]";
+  // mem=true|false|? — true/false only when the caller reported the request's
+  // injection state; "?" when unknown (no owner / not supplied).
+  const memStr = memoryInjected === true ? "true" : memoryInjected === false ? "false" : "?";
   console.log(
     `[MALFORMED-200] mode=${mode || "?"} provider=${provider || "?"} model=${model || "?"} ` +
-      `conn=${connectionId || "-"} reason=${reason || "empty"} recvBytes=${recvBytes ?? -1} ` +
+      `conn=${connectionId || "-"} reason=${reason || "empty"} mem=${memStr} ` +
+      `recvBytes=${recvBytes ?? -1} ` +
       `recvLines=${recvLines ?? -1} emitted=${emitted ?? -1} events=${evtStr} ` +
       `ttft=${ttftMs ?? -1}ms dur=${elapsedMs ?? -1}ms`
   );

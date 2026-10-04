@@ -90,7 +90,7 @@ export async function handleAudioTranslation({
 
   const token =
     providerConfig.authType === "none" ? null : credentials?.apiKey || credentials?.accessToken;
-  if (providerConfig.authType !== "none" && !token) {
+  if (providerConfig.authType !== "none" && !providerConfig.credentialsOptional && !token) {
     return errorResponse(401, `No credentials for translation provider: ${providerConfig.id}`);
   }
 

@@ -22,6 +22,8 @@ import { getModePack } from "./modePacks";
 import { getSelfHealingManager } from "./selfHealing";
 import { classifyPromptIntent } from "../intentClassifier";
 import { mapIntentToTaskFitnessKey } from "./intentTaskFitnessMap";
+import { classifyTier } from "../tierResolver";
+import { PROVIDER_TIER, type ProviderTier } from "../tierTypes";
 
 export interface AutoComboConfig {
   id: string;
@@ -40,6 +42,14 @@ export interface AutoComboConfig {
    *     silently overspending.
    */
   budgetFallback?: "cheapest" | "strict";
+  /**
+   * Per-request cost-tier ceiling (1-5) from `X-OmniRoute-Tier` (#FEAT-005). When set,
+   * only candidates whose classified tier is within the band the ceiling admits are
+   * eligible, mapping the MODES ladder (1=local-only, 2=local-free, 3=local-light-paid,
+   * 4/5=cloud/tiered) onto the free/cheap/premium tier bands. Undefined = no ceiling,
+   * so the combo's own candidate pool stands.
+   */
+  tierCeiling?: number;
   estimatedInputTokens?: number; // tokens the budget is computed against (default 1000)
   explorationRate: number; // 0.05 = 5% exploratory
   /** If set, RouterStrategy name to use for selection ('rules' | 'cost' | 'latency') */
@@ -197,6 +207,28 @@ function chooseTierWeighted(
   return fallback();
 }
 
+/**
+ * Numeric rank of a provider cost tier for ceiling comparison (#FEAT-005): free < cheap < premium.
+ */
+const TIER_RANK: Record<ProviderTier, number> = {
+  [PROVIDER_TIER.FREE]: 1,
+  [PROVIDER_TIER.CHEAP]: 2,
+  [PROVIDER_TIER.PREMIUM]: 3,
+};
+
+/**
+ * Map a per-request cost-tier ceiling (1-5, from `X-OmniRoute-Tier`) onto the highest
+ * admitted provider tier rank. The MODES ladder — 1=local-only, 2=local-free,
+ * 3=local-light-paid, 4/5=cloud/tiered — collapses onto the free/cheap/premium bands:
+ * tiers 1-2 admit free only, tier 3 adds cheap, tiers 4-5 admit everything (premium).
+ * Reusing the shared tier semantics avoids hardcoding model lists.
+ */
+function maxAdmittedTierRank(ceiling: number): number {
+  if (ceiling <= 2) return TIER_RANK[PROVIDER_TIER.FREE];
+  if (ceiling === 3) return TIER_RANK[PROVIDER_TIER.CHEAP];
+  return TIER_RANK[PROVIDER_TIER.PREMIUM];
+}
+
 const comboRotators = new Map<string, ScoreTierRotator>();
 function getRotator(comboName: string): ScoreTierRotator {
   let r = comboRotators.get(comboName);
@@ -259,11 +291,24 @@ export function selectProvider(
   }
   weights = normalizeScoringWeights(weights);
 
+  // Per-request cost-tier ceiling (#FEAT-005): admit only candidates whose classified
+  // tier is within the band the ceiling allows. Applied before scoring so the ceiling
+  // shapes the eligible pool directly; absent ceiling leaves the pool untouched. If the
+  // ceiling would empty the pool, the self-healing fallback below restores all candidates.
+  const tierCeilingRank =
+    typeof config.tierCeiling === "number" ? maxAdmittedTierRank(config.tierCeiling) : undefined;
+
   // Filter out excluded providers
   const excluded: string[] = [];
   const pool = candidates.filter((c) => {
     // Pool filter
     if (config.candidatePool.length > 0 && !config.candidatePool.includes(c.provider)) return false;
+
+    // Cost-tier ceiling filter
+    if (tierCeilingRank !== undefined) {
+      const assignment = classifyTier(c.provider, c.model);
+      if (TIER_RANK[assignment.tier] > tierCeilingRank) return false;
+    }
 
     // Self-healing exclusion
     const evaluation = healer.evaluate(c.provider, 0.5, c.circuitBreakerState);
@@ -275,8 +320,13 @@ export function selectProvider(
   });
 
   if (pool.length === 0) {
-    // Fallback: allow all candidates regardless of exclusions
-    pool.push(...candidates);
+    // Fallback: allow all candidates regardless of exclusions. The cost-tier ceiling
+    // (#FEAT-005) is an explicit per-request cap, so it still holds here — only
+    // self-healing/pool exclusions are relaxed, never the tier band.
+    const tierAdmits = (c: ProviderCandidate) =>
+      tierCeilingRank === undefined ||
+      TIER_RANK[classifyTier(c.provider, c.model).tier] <= tierCeilingRank;
+    pool.push(...candidates.filter(tierAdmits));
     excluded.length = 0;
   }
 

@@ -60,6 +60,10 @@ export interface EmbeddingHandlerOptions {
   connectionId?: string | null;
   resolvedProvider?: EmbeddingProvider | null;
   resolvedModel?: string | null;
+  /** Client request signal; lets a split embedding request stop between sub-batches. */
+  signal?: AbortSignal | null;
+  /** OmniRoute-internal caller (memory/Qdrant): over-cap items are truncated, not rejected. */
+  internalCaller?: boolean;
 }
 
 export async function createEmbeddingResponse(
@@ -441,6 +445,8 @@ export async function createEmbeddingResponse(
       clientRawRequest: options.clientRawRequest || null,
       apiKeyId: options.apiKeyId || null,
       apiKeyName: options.apiKeyName || null,
+      signal: options.signal ?? null,
+      internalCaller: options.internalCaller === true,
       // #10347 — thread the selected connection id so handleEmbedding can cool the
       // account on a hard upstream failure (previously always null on /v1/embeddings).
       connectionId:

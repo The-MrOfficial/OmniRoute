@@ -7,6 +7,7 @@
  *   X-OmniRoute-Mode:            fast | balanced | quality | <raw mode-pack name>  (#6024/#6025)
  *   X-OmniRoute-Budget:          <max USD per request>                             (#6023)
  *   X-OmniRoute-Budget-Fallback: cheapest | strict                                 (#3470)
+ *   X-OmniRoute-Tier:            1 | 2 | 3 | 4 | 5  (cost-tier ceiling)             (#FEAT-005)
  *
  * All resolvers are pure so they can be unit-tested and reused by the entry
  * handler (src/sse/handlers/chat.ts) and the combo router (open-sse/services/combo.ts).
@@ -71,12 +72,24 @@ export function resolveRequestModePack(input: unknown): RequestModePack {
  */
 export function parseRequestBudgetCap(input: unknown): number | undefined {
   const n =
-    typeof input === "number"
-      ? input
-      : typeof input === "string"
-        ? Number(input.trim())
-        : NaN;
+    typeof input === "number" ? input : typeof input === "string" ? Number(input.trim()) : NaN;
   if (!Number.isFinite(n) || n <= 0) return undefined;
+  return n;
+}
+
+/**
+ * Parse the `X-OmniRoute-Tier` header into a cost-tier ceiling (integer 1-5).
+ *
+ * The ceiling raises the eligible-model band up to the requested tier, mapping to
+ * the MODES ladder (omniroute-mode.py): 1=local-only, 2=local-free, 3=local-light-paid,
+ * 4/5=cloud/tiered. Only an integer in the inclusive range 1-5 is accepted; anything
+ * else (0, 6, "x", empty, non-string) returns `undefined` so the combo's own stored
+ * config stays in effect and no ceiling is applied.
+ */
+export function resolveRequestTier(input: unknown): number | undefined {
+  const n =
+    typeof input === "number" ? input : typeof input === "string" ? Number(input.trim()) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > 5) return undefined;
   return n;
 }
 
@@ -101,6 +114,8 @@ export interface PerRequestAutoControls {
   mode?: string;
   budgetCap?: number;
   budgetFallback?: RequestBudgetFallback;
+  /** Per-request cost-tier ceiling (1-5) from `X-OmniRoute-Tier` — #FEAT-005. */
+  tierCeiling?: number;
 }
 
 /**
@@ -116,14 +131,17 @@ export function resolveRequestAutoControls(headers: {
   const modeHeader = headers.get("x-omniroute-mode")?.trim() || null;
   const budgetHeader = headers.get("x-omniroute-budget")?.trim() || null;
   const budgetFallbackHeader = headers.get("x-omniroute-budget-fallback")?.trim() || null;
+  const tierHeader = headers.get("x-omniroute-tier")?.trim() || null;
 
   const mode = resolveRequestModePack(modeHeader);
   const budgetCap = parseRequestBudgetCap(budgetHeader);
   const budgetFallback = parseRequestBudgetFallback(budgetFallbackHeader);
+  const tierCeiling = resolveRequestTier(tierHeader);
 
   return {
     ...(mode.override && modeHeader ? { mode: modeHeader } : {}),
     ...(budgetCap !== undefined ? { budgetCap } : {}),
     ...(budgetFallback !== undefined ? { budgetFallback } : {}),
+    ...(tierCeiling !== undefined ? { tierCeiling } : {}),
   };
 }

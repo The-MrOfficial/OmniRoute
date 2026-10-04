@@ -86,6 +86,7 @@ import {
 } from "../translator/helpers/toolCallHelper.ts";
 import { restoreClaudeToolName } from "../services/claudeCodeToolRemapper.ts";
 import { normalizeFinalOpenAIStreamChunk } from "./openAIStreamChunk.ts";
+import { unwrapStringifiedToolArgFields } from "./toolCallArguments.ts";
 import { collectClaudeDelta } from "./streamClaudeDelta.ts";
 import { createStreamTiming, type StreamTiming } from "./streamTiming.ts";
 import { buildUsageOnlyChunk } from "./usageOnlyChunk.ts";
@@ -2032,6 +2033,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                   const delta = parsed.choices?.[0]?.delta;
                   let textualToolCallConverted = false;
                   let toolCallIdCoerced = false;
+                  let toolCallArgsRepaired = false;
                   let splitMixedReasoningContent = false;
                   const thinkParsed = applyThinkTag(thinkState, delta);
 
@@ -2107,6 +2109,21 @@ export function createSSEStream(options: StreamOptions = {}) {
                         key = `id:${tc.id}`;
                       } else {
                         key = `seq:${++passthroughToolCallSeq}`;
+                      }
+                      // Repair arguments whose nested fields were double-encoded
+                      // as JSON strings (self-hosted llama.cpp GLM stringifies
+                      // the `parallel_tasks` tasks array, which Zoo then rejects
+                      // as "no valid tasks array"). The helper only acts when a
+                      // delta carries COMPLETE, parseable object arguments with a
+                      // stringified array/object field, and is byte-identical
+                      // passthrough otherwise — fragmented deltas never parse, so
+                      // they are left untouched and re-concatenated as before.
+                      if (typeof tc?.function?.arguments === "string" && tc.function.arguments) {
+                        const repaired = unwrapStringifiedToolArgFields(tc.function.arguments);
+                        if (repaired !== tc.function.arguments) {
+                          tc.function.arguments = repaired;
+                          toolCallArgsRepaired = true;
+                        }
                       }
                       const existing = passthroughToolCalls.get(key);
                       const deltaArgs =
@@ -2231,6 +2248,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                     idFixed ||
                     needsReserialization ||
                     toolCallIdCoerced ||
+                    toolCallArgsRepaired ||
                     hadNonStringToolCallId ||
                     hadNonStringTopLevelId ||
                     restoredOpenAIToolName

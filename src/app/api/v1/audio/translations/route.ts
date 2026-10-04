@@ -90,10 +90,11 @@ async function translateWithModel(
     // NOTE: the 2nd arg of this helper is `excludeConnectionId`, not "use this
     // connection" — a combo target's connectionId must never be passed here.
     credentials = await getProviderCredentialsWithQuotaPreflight(credentialKey);
-    if (!credentials) {
+    // Allowlisted local hosts (`credentialsOptional`) proceed unauthenticated.
+    if (!credentials && !providerConfig.credentialsOptional) {
       return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${provider}`);
     }
-    if (isAllRateLimitedCredentials(credentials)) {
+    if (credentials && isAllRateLimitedCredentials(credentials)) {
       return rateLimitedProviderResponse(provider, credentials);
     }
   }

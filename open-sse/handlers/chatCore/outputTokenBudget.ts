@@ -1,3 +1,5 @@
+import { getContextOutputReserveTokens } from "./contextEstimateConfig.ts";
+
 export const OUTPUT_TOKEN_FIELDS = [
   "max_tokens",
   "max_completion_tokens",
@@ -16,7 +18,37 @@ export type OutputTokenBudgetResult =
       estimatedInputTokens: number;
       contextLimit: number;
       maxInputTokens?: number | null;
+      /** Set when the rejection came from input > contextLimit − outputReserveTokens. */
+      outputReserveTokens?: number;
     };
+
+/**
+ * Output room to reserve in the context window for admission.
+ *
+ * The client's own max_tokens / max_completion_tokens / max_output_tokens (the
+ * largest positive one) when present, otherwise OMNIROUTE_CONTEXT_OUTPUT_RESERVE_TOKENS
+ * (default 16384). Clamped to the model's output cap and to floor(contextLimit / 4)
+ * so small-window models always keep at least 75% of the window for input.
+ * Returns 0 when nothing should be reserved (legacy ≥1-token behavior).
+ */
+export function resolveOutputReserveTokens(
+  body: Record<string, unknown> | null | undefined,
+  contextLimit: number,
+  modelOutputCap?: number | null
+): number {
+  const requested = OUTPUT_TOKEN_FIELDS.map((field) => body?.[field]).filter(
+    (value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0
+  );
+  let reserve =
+    requested.length > 0 ? Math.floor(Math.max(...requested)) : getContextOutputReserveTokens();
+  if (typeof modelOutputCap === "number" && Number.isFinite(modelOutputCap) && modelOutputCap > 0) {
+    reserve = Math.min(reserve, Math.floor(modelOutputCap));
+  }
+  if (Number.isFinite(contextLimit) && contextLimit > 0) {
+    reserve = Math.min(reserve, Math.floor(contextLimit / 4));
+  }
+  return Math.max(0, reserve);
+}
 
 type OutputTokenAdjustment = { field: string; value?: number; remove?: boolean };
 
@@ -82,6 +114,11 @@ function adjustOutputTokenFields(
  * and remains responsible for reserving output room; the input cap never
  * double-counts a requested output. Absent / null / non-positive input caps
  * leave behavior byte-identical (fail-open).
+ *
+ * `outputReserveTokens` (see `resolveOutputReserveTokens`) rejects when the
+ * prompt leaves less than that many tokens of the window for the reply
+ * (`input > contextLimit − reserve`). Absent / null / 0 keeps the legacy
+ * `contextLimit − input >= 1` behavior byte-identical.
  */
 export function enforceOutputTokenBudget(
   body: Record<string, unknown> | null | undefined,
@@ -89,7 +126,8 @@ export function enforceOutputTokenBudget(
   contextLimit: number,
   defaultOutputTokens = 0,
   maxOutputTokenCap?: number | null,
-  maxInputTokenCap?: number | null
+  maxInputTokenCap?: number | null,
+  outputReserveTokens?: number | null
 ): OutputTokenBudgetResult {
   const normalizedInputTokens = Math.max(0, Math.ceil(estimatedInputTokens));
   const normalizedContextLimit = Math.max(1, Math.floor(contextLimit));
@@ -109,6 +147,21 @@ export function enforceOutputTokenBudget(
       estimatedInputTokens: normalizedInputTokens,
       contextLimit: normalizedContextLimit,
       maxInputTokens: normalizedInputCap,
+    };
+  }
+
+  // Output reserve: the prompt must leave `reserve` tokens of the window for the
+  // reply. Null / 0 / non-finite keeps the legacy ≥1-token check below unchanged.
+  const normalizedReserve =
+    typeof outputReserveTokens === "number" && Number.isFinite(outputReserveTokens)
+      ? Math.max(0, Math.floor(outputReserveTokens))
+      : 0;
+  if (normalizedReserve > 0 && normalizedInputTokens > normalizedContextLimit - normalizedReserve) {
+    return {
+      ok: false,
+      estimatedInputTokens: normalizedInputTokens,
+      contextLimit: normalizedContextLimit,
+      outputReserveTokens: normalizedReserve,
     };
   }
 

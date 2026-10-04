@@ -5,6 +5,7 @@ import {
   formatMemoryContext,
   providerSupportsSystemMessage,
   ChatRequest,
+  ChatMessage,
 } from "../injection";
 import { Memory, MemoryType } from "../types";
 
@@ -211,6 +212,151 @@ describe("injectMemory — Claude-family cache-safe splice gate (#11290)", () =>
     expect(result.messages[0].content).toContain("SYSTEM PROMPT");
     expect(result.messages[2]).toEqual({ role: "assistant", content: "turn 1 answer" });
     expect(result.messages[3]).toEqual({ role: "user", content: "turn 2 question" });
+  });
+});
+
+describe("injectMemory — self-hosted strict system-first providers (Failure C)", () => {
+  const STRICT_PROVIDERS = ["vllm", "ollama-local", "ollama", "llama-cpp", "llamacpp"];
+
+  for (const provider of STRICT_PROVIDERS) {
+    test(`${provider}: cache-safe injection merges memory into the leading system message (index 0)`, () => {
+      const request = makeRequest({
+        messages: [
+          { role: "system", content: "SELF-HOSTED SYSTEM PROMPT" },
+          { role: "user", content: "turn 1 question" },
+          { role: "assistant", content: "turn 1 answer" },
+          { role: "user", content: "turn 2 question" },
+        ],
+      });
+      const memories = [makeMemory("User prefers concise answers")];
+
+      const result = injectMemory(request, memories, provider, { cacheSafe: true });
+
+      // Memory must be merged INTO messages[0], starting with the memory text.
+      expect(result.messages[0].role).toBe("system");
+      // This case uses string content; narrow explicitly since ChatMessage.content
+      // is now `string | ContentBlock[]` after the array-shape widening.
+      expect(typeof result.messages[0].content).toBe("string");
+      const mergedContent = result.messages[0].content as string;
+      expect(mergedContent.startsWith("Memory context: User prefers concise answers")).toBe(true);
+      expect(mergedContent).toContain("SELF-HOSTED SYSTEM PROMPT");
+
+      // No system-role message may exist at any index > 0 (strict templates 400/500 on it).
+      const laterSystem = result.messages.slice(1).filter((m) => m.role === "system");
+      expect(laterSystem).toHaveLength(0);
+
+      // Original turns preserved contiguously after the merged system message.
+      expect(result.messages).toHaveLength(4);
+      expect(result.messages[1]).toEqual({ role: "user", content: "turn 1 question" });
+      expect(result.messages[2]).toEqual({ role: "assistant", content: "turn 1 answer" });
+      expect(result.messages[3]).toEqual({ role: "user", content: "turn 2 question" });
+    });
+  }
+
+  // Regression for the orchestrator-prompt-destruction bug: the Roo/Zoo OpenAI-format
+  // client sends messages[0].content as an ARRAY of content blocks. Blindly interpolating
+  // it collapsed a 54K system prompt to "[object Object]" (findings §Q5). The merge must
+  // be shape-aware: prepend memory as a leading text block, preserving the original blocks.
+  for (const provider of STRICT_PROVIDERS) {
+    test(`${provider}: array-shaped system content merges memory as a leading text block without "[object Object]"`, () => {
+      const request = makeRequest({
+        messages: [
+          {
+            role: "system",
+            content: [
+              { type: "text", text: "You are Zoo, the orchestrator." },
+              { type: "text", text: "start them together" },
+            ],
+          },
+          { role: "user", content: "dispatch the tasks" },
+        ],
+      });
+      const memories = [makeMemory("User prefers concise answers")];
+
+      const result = injectMemory(request, memories, provider);
+
+      const first = result.messages[0];
+      expect(first.role).toBe("system");
+      // Content must remain an array of blocks (not coerced to a string).
+      expect(Array.isArray(first.content)).toBe(true);
+      const blocks = first.content as Array<{ type: string; text?: string }>;
+
+      // (b) memory is merged into the leading text block; no block is added, because
+      // Ollama expands each system block into its own system message.
+      expect(blocks).toHaveLength(2);
+      expect(blocks[0]).toEqual({
+        type: "text",
+        text: "Memory context: User prefers concise answers\nYou are Zoo, the orchestrator.",
+      });
+
+      // (a) the original block text survives in order.
+      const allText = blocks.map((b) => b.text ?? "").join("\n");
+      expect(allText).toContain("You are Zoo, the orchestrator.");
+      expect(allText).toContain("start them together");
+
+      // (c) nowhere in the merged content is the "[object Object]" coercion signature.
+      expect(allText).not.toContain("[object Object]");
+      expect(JSON.stringify(result.messages)).not.toContain("[object Object]");
+
+      // Strict templates still forbid a system message at any later index.
+      const laterSystem = result.messages.slice(1).filter((m) => m.role === "system");
+      expect(laterSystem).toHaveLength(0);
+    });
+  }
+
+  test("ollama: single-block system content stays a single block after memory merge", () => {
+    const request = makeRequest({
+      messages: [
+        { role: "system", content: [{ type: "text", text: "You are a reader." }] },
+        { role: "user", content: "read the spec" },
+      ],
+    });
+    const result = injectMemory(request, [makeMemory("spec lives in specs/")], "ollama-local");
+    const blocks = result.messages[0].content as Array<{ type: string; text?: string }>;
+    expect(blocks).toEqual([
+      { type: "text", text: "Memory context: spec lives in specs/\nYou are a reader." },
+    ]);
+  });
+
+  test("array system content with a non-text lead block gets a new leading memory block", () => {
+    const request = makeRequest({
+      messages: [
+        {
+          role: "system",
+          content: [
+            { type: "image_url", image_url: { url: "data:," } },
+            { type: "text", text: "Describe it." },
+          ] as unknown as ChatMessage["content"],
+        },
+        { role: "user", content: "go" },
+      ],
+    });
+    const result = injectMemory(request, [makeMemory("m")], "vllm");
+    const blocks = result.messages[0].content as Array<{ type: string; text?: string }>;
+    expect(blocks[0]).toEqual({ type: "text", text: "Memory context: m" });
+    expect(blocks).toHaveLength(3);
+  });
+
+  test("regression guard: non-strict provider keeps the #3890 cache-safe mid-array splice", () => {
+    const request = makeRequest({
+      messages: [
+        { role: "system", content: "SYSTEM PROMPT" },
+        { role: "user", content: "turn 1 question" },
+        { role: "assistant", content: "turn 1 answer" },
+        { role: "user", content: "turn 2 question" },
+      ],
+    });
+    const memories = [makeMemory("User prefers concise answers")];
+
+    const result = injectMemory(request, memories, "openai", { cacheSafe: true });
+
+    // The memory system message is spliced just before the LAST user turn (mid-array),
+    // leaving the original leading system message untouched at index 0.
+    expect(result.messages).toHaveLength(5);
+    expect(result.messages[0]).toEqual({ role: "system", content: "SYSTEM PROMPT" });
+    expect(result.messages[3].role).toBe("system");
+    expect(result.messages[3].content).toBe("Memory context: User prefers concise answers");
+    expect(result.messages[4]).toEqual({ role: "user", content: "turn 2 question" });
   });
 });
 

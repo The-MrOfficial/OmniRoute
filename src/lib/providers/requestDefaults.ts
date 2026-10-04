@@ -149,6 +149,9 @@ export function normalizeCacheOverride(value: unknown): JsonRecord | undefined {
   ) {
     normalized.cacheControlPassthrough = record.cacheControlPassthrough;
   }
+  if (typeof record.prefixCacheSensitive === "boolean") {
+    normalized.prefixCacheSensitive = record.prefixCacheSensitive;
+  }
 
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 }

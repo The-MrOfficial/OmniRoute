@@ -68,3 +68,95 @@ test("rejects when a Claude target's default output budget does not fit", () => 
     contextLimit: 128_000,
   });
 });
+
+// ── Output reserve (window − requested-or-default max output) ───────────────
+
+const { resolveOutputReserveTokens } =
+  await import("../../open-sse/handlers/chatCore/outputTokenBudget.ts");
+
+function withReserveEnv(value: string | undefined, fn: () => void) {
+  const key = "OMNIROUTE_CONTEXT_OUTPUT_RESERVE_TOKENS";
+  const saved = process.env[key];
+  try {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+    fn();
+  } finally {
+    if (saved === undefined) delete process.env[key];
+    else process.env[key] = saved;
+  }
+}
+
+test("a 57K-token request is admitted to a 131072-context target with the default reserve", () => {
+  withReserveEnv(undefined, () => {
+    const body = { messages: [] };
+    const reserve = resolveOutputReserveTokens(body, 131_072, null);
+    assert.equal(reserve, 16_384);
+    const result = enforceOutputTokenBudget(body, 57_000, 131_072, 0, null, null, reserve);
+    assert.equal(result.ok, true);
+  });
+});
+
+test("input above window − default reserve is rejected and reports the reserve", () => {
+  withReserveEnv(undefined, () => {
+    const body = { messages: [] };
+    const reserve = resolveOutputReserveTokens(body, 131_072, null);
+    const result = enforceOutputTokenBudget(body, 120_000, 131_072, 0, null, null, reserve);
+    assert.deepEqual(result, {
+      ok: false,
+      estimatedInputTokens: 120_000,
+      contextLimit: 131_072,
+      outputReserveTokens: 16_384,
+    });
+    // 131072 − 16384 = 114688 is the exact boundary.
+    assert.equal(enforceOutputTokenBudget(body, 114_688, 131_072, 0, null, null, reserve).ok, true);
+    assert.equal(
+      enforceOutputTokenBudget(body, 114_689, 131_072, 0, null, null, reserve).ok,
+      false
+    );
+  });
+});
+
+test("the client's own max output is the reserve when present", () => {
+  withReserveEnv(undefined, () => {
+    assert.equal(resolveOutputReserveTokens({ max_tokens: 4096 }, 131_072, null), 4096);
+    assert.equal(
+      resolveOutputReserveTokens({ max_tokens: 2048, max_completion_tokens: 6000 }, 131_072, null),
+      6000
+    );
+    // Invalid client values fall back to the default.
+    assert.equal(resolveOutputReserveTokens({ max_tokens: -1 }, 131_072, null), 16_384);
+  });
+});
+
+test("the reserve is clamped to the model output cap and to window/4", () => {
+  withReserveEnv(undefined, () => {
+    assert.equal(resolveOutputReserveTokens({}, 131_072, 8192), 8192);
+    assert.equal(resolveOutputReserveTokens({}, 32_768, null), 8192);
+    assert.equal(resolveOutputReserveTokens({ max_tokens: 30_000 }, 32_768, null), 8192);
+  });
+});
+
+test("OMNIROUTE_CONTEXT_OUTPUT_RESERVE_TOKENS=0 restores the legacy ≥1-token check", () => {
+  withReserveEnv("0", () => {
+    const reserve = resolveOutputReserveTokens({}, 131_072, null);
+    assert.equal(reserve, 0);
+    assert.equal(enforceOutputTokenBudget({}, 131_071, 131_072, 0, null, null, reserve).ok, true);
+    assert.equal(enforceOutputTokenBudget({}, 131_072, 131_072, 0, null, null, reserve).ok, false);
+  });
+});
+
+test("an omitted/null reserve is byte-identical to the legacy behavior", () => {
+  const legacy = enforceOutputTokenBudget({ max_tokens: 10 }, 131_000, 131_072);
+  const withNull = enforceOutputTokenBudget(
+    { max_tokens: 10 },
+    131_000,
+    131_072,
+    0,
+    null,
+    null,
+    null
+  );
+  assert.deepEqual(withNull, legacy);
+  assert.equal(legacy.ok, true);
+});

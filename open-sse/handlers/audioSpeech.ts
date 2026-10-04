@@ -27,7 +27,11 @@ import { GttsUpstreamError, normalizeGttsLang, synthesizeGtts } from "../executo
 import { handleFishAudioSpeech } from "../executors/fishAudioTts.ts";
 import { errorResponse } from "../utils/error.ts";
 import { resolveElevenLabsVoiceId } from "./elevenLabsVoiceMap.ts";
-import { audioStreamResponse, upstreamErrorResponse } from "../utils/audioResponse.ts";
+import {
+  audioStreamResponse,
+  speechFormatMimeType,
+  upstreamErrorResponse,
+} from "../utils/audioResponse.ts";
 import {
   getKieCallbackUrl,
   getKieErrorMessage,
@@ -875,7 +879,12 @@ export async function handleAudioSpeech({
   // whose durable Clerk credential lives in providerSpecificData (no apiKey token).
   const token =
     providerConfig.authType === "none" ? null : credentials?.apiKey || credentials?.accessToken;
-  if (providerConfig.authType !== "none" && providerConfig.format !== "uc-tts" && !token) {
+  if (
+    providerConfig.authType !== "none" &&
+    providerConfig.format !== "uc-tts" &&
+    !providerConfig.credentialsOptional &&
+    !token
+  ) {
     return errorResponse(401, `No credentials for speech provider: ${providerConfig.id}`);
   }
 
@@ -986,6 +995,7 @@ export async function handleAudioSpeech({
     }
 
     // Default: OpenAI-compatible JSON → audio stream proxy (also used by Qwen3)
+    const responseFormat = normalizeSpeechResponseFormat(body.response_format);
     const res = await fetch(providerConfig.baseUrl, {
       method: "POST",
       headers: {
@@ -996,7 +1006,7 @@ export async function handleAudioSpeech({
         model: modelId,
         input: body.input,
         voice: body.voice || "alloy",
-        response_format: normalizeSpeechResponseFormat(body.response_format),
+        response_format: responseFormat,
         speed: body.speed || 1.0,
       }),
     });
@@ -1005,7 +1015,7 @@ export async function handleAudioSpeech({
       return upstreamErrorResponse(res, await res.text());
     }
 
-    return audioStreamResponse(res);
+    return audioStreamResponse(res, speechFormatMimeType(responseFormat));
   } catch (err) {
     return errorResponse(500, `Speech request failed: ${err.message}`);
   }

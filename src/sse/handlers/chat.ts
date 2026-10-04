@@ -40,6 +40,7 @@ import {
 import type { ComboLike, SingleModelTarget } from "@omniroute/open-sse/services/combo/types.ts";
 import { mergeAbortSignals } from "@omniroute/open-sse/executors/base.ts";
 import { resolveRequestAutoControls } from "@omniroute/open-sse/services/autoCombo/requestControls.ts";
+import { isGlobalFallbackAllowedForTier } from "@omniroute/open-sse/services/combo/tierCeiling.ts";
 import { isVerifiedNativeCodexRequest } from "@omniroute/open-sse/config/codexIdentity.ts";
 import { resolveCompressionSettings } from "@omniroute/open-sse/handlers/chatCore/compressionSettings.ts";
 import type { CompressionExclusions } from "@omniroute/open-sse/services/compression/exclusions.ts";
@@ -1257,7 +1258,27 @@ async function handleChatImplementation(
 
     // ── Global Fallback Provider (#689) ────────────────────────────────────
     // If combo exhausted all models, try the global fallback before giving up.
+    // A per-request tier ceiling below 5 blocks it: the fallback model is unclassified
+    // and could be a paid cloud model, which would escalate past X-OmniRoute-Tier.
+    const globalFallbackAllowedForTier = isGlobalFallbackAllowedForTier(
+      perRequestAutoControls.tierCeiling
+    );
+    const configuredGlobalFallback = (settings as { globalFallbackModel?: unknown } | null)
+      ?.globalFallbackModel;
     if (
+      !globalFallbackAllowedForTier &&
+      !response.ok &&
+      [502, 503].includes(response.status) &&
+      typeof configuredGlobalFallback === "string" &&
+      configuredGlobalFallback.trim()
+    ) {
+      log.info(
+        "GLOBAL_FALLBACK",
+        `Global fallback skipped for combo "${combo.name}": tier ceiling ${perRequestAutoControls.tierCeiling}`
+      );
+    }
+    if (
+      globalFallbackAllowedForTier &&
       !response.ok &&
       [502, 503].includes(response.status) &&
       typeof (settings as any)?.globalFallbackModel === "string" &&

@@ -1,6 +1,7 @@
 import type { CompressionConfig } from "./types.ts";
 import type { CachingDetectionContext } from "./cachingAware.ts";
 import { detectCachingContext, getCacheAwareStrategy } from "./cachingAware.ts";
+import { isPrefixCacheSensitive } from "../../utils/cacheControlPolicy.ts";
 import {
   normalizePreserveSystemPromptMode,
   resolvePreserveSystemPrompt,
@@ -55,6 +56,18 @@ export function resolveCacheAwareConfig(
     : false;
   const hasCache = staticCache || (body ? observeAndCheckPrefixFreeze(body) : false);
   const effective = resolvePreserveSystemPrompt(mode, { hasCache });
-  if (effective === config.preserveSystemPrompt) return config;
-  return { ...config, preserveSystemPrompt: effective };
+  const prefixCacheSensitive = isPrefixCacheSensitive(
+    context?.provider,
+    context?.connectionCacheOverride
+  );
+  if (
+    effective === config.preserveSystemPrompt &&
+    prefixCacheSensitive === (config.prefixCacheSensitive === true)
+  ) {
+    return config;
+  }
+  const next: CompressionConfig = { ...config, preserveSystemPrompt: effective };
+  if (prefixCacheSensitive) next.prefixCacheSensitive = true;
+  else delete next.prefixCacheSensitive;
+  return next;
 }

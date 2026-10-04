@@ -200,6 +200,25 @@ export function getRegistryModelThinkingEfforts(
   return model?.supportedThinkingEfforts;
 }
 
+/**
+ * Resolve the "drop effort above the declared ceiling" policy for a model,
+ * mirroring the vocabulary resolution precedence used by the forwarding clamp:
+ * an explicit per-model flag wins, otherwise the provider-level flag applies
+ * only when the model itself declares no explicit vocabulary (so the matched
+ * ceiling actually came from `defaultSupportedThinkingEfforts`).
+ */
+export function getRegistryOmitEffortAboveCeiling(provider: string, modelId: string): boolean {
+  const entry = getRegistryEntry(provider);
+  if (!entry) return false;
+  const model = entry.models.find((candidate) => candidate.id === modelId);
+  if (model?.supportedThinkingEfforts !== undefined) {
+    return model.omitEffortAboveDeclaredCeiling === true;
+  }
+  // No per-model vocabulary → the clamp uses the provider default ceiling, so
+  // the provider-level flag governs.
+  return entry.omitEffortAboveDeclaredCeiling === true;
+}
+
 /** Resolve a model's explicit reasoning vocabulary before its provider fallback. */
 export function getRegistryThinkingEfforts(
   provider: string,

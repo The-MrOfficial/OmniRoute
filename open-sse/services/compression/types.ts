@@ -225,6 +225,13 @@ export interface CompressionConfig {
    * (`false → whenNoCache`, otherwise `always`).
    */
   preserveSystemPromptMode?: PreserveSystemPromptMode;
+  /**
+   * Runtime-only (never persisted): set by `resolveCacheAwareConfig` when the routed
+   * connection is prefix-cache-sensitive (`isPrefixCacheSensitive`). Lite then skips
+   * tool-result truncation, which would otherwise rewrite last turn's tool result on
+   * the next request and force the upstream to re-prefill from the divergence.
+   */
+  prefixCacheSensitive?: boolean;
   mcpDescriptionCompressionEnabled?: boolean;
   comboOverrides: Record<string, CompressionMode>;
   compressionComboId?: string | null;

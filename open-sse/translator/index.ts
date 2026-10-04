@@ -10,6 +10,7 @@ import {
 } from "./helpers/claudeHelper.ts";
 import { filterToOpenAIFormat } from "./helpers/openaiHelper.ts";
 import {
+  isPrefixCacheSensitive,
   providerHonorsOpenAIFormatCacheControl,
   resolveConnectionCacheOverride,
 } from "../utils/cacheControlPolicy.ts";
@@ -26,11 +27,10 @@ import {
 } from "./helpers/schemaCoercion.ts";
 import { getRequestTranslator, getResponseTranslator } from "./registry.ts";
 import { bootstrapTranslatorRegistry } from "./bootstrap.ts";
-import { hasThinkingConfig, normalizeThinkingConfig } from "../services/provider.ts";
+import { normalizeThinkingConfig } from "../services/provider.ts";
 import { applyThinkingBudget } from "../services/thinkingBudget.ts";
 import { applyReasoningRuleDirective } from "@/lib/reasoningRouting/policy";
 import { getModelPreserveVideoUrl } from "@/lib/db/models/modelPreserveVideoUrl";
-import { getResolvedModelCapabilities, supportsReasoning } from "../services/modelCapabilities.ts";
 import { normalizeRoles } from "../services/roleNormalizer.ts";
 import { hoistLeadingSystemMessage } from "./helpers/strictSystemHoist.ts";
 import {
@@ -44,6 +44,7 @@ import {
   RESPONSES_STORE_MARKER,
 } from "./request/openai-responses/helpers.ts";
 import { applyReasoningInputPolicy } from "../services/reasoningInputPolicy.ts";
+import { resolveReasoningForwarding } from "./reasoningForwarding.ts";
 
 bootstrapTranslatorRegistry();
 export { register } from "./registry.ts";
@@ -365,6 +366,10 @@ export function translateRequest(
   );
   const normalizedProvider = String(provider ?? "");
   const normalizedModel = String(model ?? "");
+  // Prefix-cache-sensitive upstreams (ds4/GLM-5.3 on llama-cpp) re-render replayed
+  // reasoning into the prompt; stripping it changes already-sent bytes and forces
+  // a full re-prefill, so client reasoning_content must be forwarded unchanged.
+  const keepClientReasoning = isPrefixCacheSensitive(provider, connectionCacheOverride);
   const isKimiCoding =
     normalizedProvider === "kimi-coding" || normalizedProvider === "kimi-coding-apikey";
 
@@ -388,24 +393,14 @@ export function translateRequest(
 
   // Resolve the replay contract before Responses input is converted: conversion
   // must know whether reasoning items are protocol history rather than display metadata.
-  const resolvedCapabilities = getResolvedModelCapabilities({
-    provider: normalizedProvider,
-    model: normalizedModel,
-  });
-  const replayRequirements = {
-    provider: normalizedProvider,
-    model: normalizedModel,
-    thinkingEnabled: hasThinkingConfig(result),
-    supportsReasoning: supportsReasoning({
-      provider: normalizedProvider,
-      model: normalizedModel,
-    }),
-    interleavedField: resolvedCapabilities?.interleavedField ?? null,
-  };
-  const isReasoner = requiresReasoningReplay(replayRequirements);
-  const requiresExplicitReasoningReplay = requiresReasoningReplay({
-    ...replayRequirements,
-    allowLegacyFallback: false,
+  // Shared with the pre-flight context estimator (reasoningForwarding.ts) so the
+  // admission estimate and the strip/forward decision below cannot drift.
+  const { isReasoner, requiresExplicitReasoningReplay } = resolveReasoningForwarding({
+    provider,
+    model,
+    targetFormat,
+    body: result,
+    connectionCacheOverride,
   });
   const preserveResponsesReasoning = sourceFormat === FORMATS.OPENAI_RESPONSES && isReasoner;
 
@@ -626,7 +621,7 @@ export function translateRequest(
         options?.preserveCacheControl === true &&
         providerHonorsOpenAIFormatCacheControl(provider, connectionCacheOverride),
       // #4849 regression guard: keep client reasoning_content for replay providers.
-      preserveReasoningContent: isReasoner,
+      preserveReasoningContent: isReasoner || keepClientReasoning,
       // Per-provider/model preserveVideoUrl flag from compat overrides.
       // Falls back to true for moonshot/kimi when unset (legacy behavior).
       preserveVideoUrl:
@@ -842,6 +837,7 @@ export function translateRequest(
   ) {
     for (const msg of result.messages) {
       for (const field of OPENAI_INCOMPATIBLE_ECHO_FIELDS) {
+        if (keepClientReasoning && field === "reasoning_content") continue;
         if (msg[field] !== undefined) {
           delete msg[field];
         }

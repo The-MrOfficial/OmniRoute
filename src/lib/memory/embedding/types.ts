@@ -40,4 +40,6 @@ export interface EmbeddingError {
   reason:
     "no_key" | "model_load_failed" | "request_failed" | "rate_limited" | "timeout" | "unknown";
   message: string; // ALWAYS via sanitizeErrorMessage()
+  /** Upstream HTTP status when the failure came from a non-OK response. */
+  status?: number;
 }

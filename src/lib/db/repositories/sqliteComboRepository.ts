@@ -93,7 +93,13 @@ function normalizeStoredCombo(
 
 function parseComboRow(row: unknown): JsonRecord | null {
   const payload = getSerializedData(row);
-  if (!payload) return null;
+  if (!payload) {
+    const id = getComboId(row);
+    console.warn(
+      `[DB] Skipping combo row with non-string/empty data column${id ? ` (id=${id})` : ""}.`
+    );
+    return null;
+  }
   const parsed = withRowId(payload, asRecord(row));
   // Merge deduplicated column values back into the record
   const record = asRecord(row);

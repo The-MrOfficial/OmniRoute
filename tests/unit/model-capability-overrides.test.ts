@@ -244,6 +244,62 @@ describe("model capability overrides", () => {
     assert.deepEqual(after.supportedThinkingEfforts, before.supportedThinkingEfforts);
   });
 
+  it("caches reasoning_efforts overrides and rebuilds only on write (version-signal invalidation)", () => {
+    assert.equal(
+      overrides.setModelCapabilityOverride("ollama-local/qwen3.8", "reasoning_efforts", [
+        "low",
+        "medium",
+        "xhigh",
+      ]),
+      true
+    );
+
+    // First cached read populates the in-memory map.
+    assert.deepEqual(overrides.getCachedReasoningEffortsOverride("ollama-local", "qwen3.8"), [
+      "low",
+      "medium",
+      "xhigh",
+    ]);
+
+    // Second read must NOT touch SQLite — spy on the shared DB handle's prepare()
+    // and assert zero statements are prepared across the next cached call.
+    const db = coreDb.getDbInstance();
+    const originalPrepare = db.prepare.bind(db);
+    let prepareCalls = 0;
+    // Test double: count prepared statements without changing behavior. No typed
+    // alternative exists for intercepting better-sqlite3's prepare() here.
+    (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+      prepareCalls += 1;
+      return originalPrepare(sql);
+    }) as typeof db.prepare;
+
+    try {
+      assert.deepEqual(overrides.getCachedReasoningEffortsOverride("ollama-local", "qwen3.8"), [
+        "low",
+        "medium",
+        "xhigh",
+      ]);
+      assert.equal(prepareCalls, 0, "second cached read must not query SQLite");
+    } finally {
+      (db as unknown as { prepare: typeof db.prepare }).prepare = originalPrepare;
+    }
+
+    // A write bumps modelCatalogCacheVersion (via invalidateDbCache
+    // "model-capabilities"); the next cached read must rebuild and reflect it,
+    // with no manual invalidation and no process restart.
+    assert.equal(
+      overrides.setModelCapabilityOverride("ollama-local/qwen3.8", "reasoning_efforts", [
+        "low",
+        "medium",
+      ]),
+      true
+    );
+    assert.deepEqual(overrides.getCachedReasoningEffortsOverride("ollama-local", "qwen3.8"), [
+      "low",
+      "medium",
+    ]);
+  });
+
   it("rejects invalid targets and non-positive values", () => {
     assert.equal(overrides.setModelCapabilityOverride("gpt-4o", "max_output_tokens", 1000), false);
     assert.equal(

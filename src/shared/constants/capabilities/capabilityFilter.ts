@@ -17,6 +17,8 @@
 
 import { getResolvedModelCapabilities } from "@/lib/modelCapabilities";
 import { evaluateContextLimit } from "@omniroute/open-sse/services/combo/contextOverrideGate";
+import { splitAssistantReasoning } from "@omniroute/open-sse/utils/assistantReasoning";
+import { getContextEstimateMargin } from "@omniroute/open-sse/handlers/chatCore/contextEstimateConfig";
 import { isRecord } from "@omniroute/open-sse/services/combo/comboData";
 import {
   hasEstimableContent,
@@ -56,12 +58,21 @@ function requestRequiresStructuredOutput(body: Record<string, unknown>): boolean
   return type === "json_object" || type === "json_schema";
 }
 
+// Advisory compat-filter estimate. Historical assistant reasoning is excluded:
+// per-target forwarding is not known at this layer, and most OpenAI-format
+// targets have it stripped by the translator. The final chatCore gate counts
+// forwarded reasoning per target and stays authoritative. The same safety
+// margin as the gate (OMNIROUTE_CONTEXT_ESTIMATE_MARGIN) is applied.
 function estimateRequestInputTokens(body: Record<string, unknown>): number {
   const estimatePayload: Record<string, unknown> = {};
   for (const key of ["messages", "input", "tools", "functions", "response_format"]) {
-    if (hasEstimableContent(body[key])) estimatePayload[key] = body[key];
+    if (hasEstimableContent(body[key])) {
+      estimatePayload[key] =
+        key === "messages" ? splitAssistantReasoning(body[key]).messages : body[key];
+    }
   }
-  return Object.keys(estimatePayload).length > 0 ? estimateTokens(estimatePayload) : 0;
+  if (Object.keys(estimatePayload).length === 0) return 0;
+  return Math.ceil(estimateTokens(estimatePayload) * getContextEstimateMargin());
 }
 
 function getPositiveTokenCount(value: unknown): number {

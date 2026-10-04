@@ -1,10 +1,19 @@
 "use client";
 
-import { useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 import Card from "../Card";
-import { getModelColor } from "@/shared/constants/colors";
 import { fmtCompact as fmt, fmtCost } from "@/shared/utils/formatting";
+import {
+  DEFAULT_MODEL_USAGE_TOP_N,
+  MODEL_USAGE_TOP_N_OPTIONS,
+  MODEL_USAGE_TOP_N_STORAGE_KEY,
+  buildModelUsageSeries,
+  parseModelUsageTopN,
+  type ModelUsageRow,
+  type ModelUsageSeries,
+  type ModelUsageTopN,
+} from "./modelUsageSeries";
 import { ChartLoadingCard, DarkTooltip, useRecharts } from "./rechartsCore";
 
 // ── DailyTrendChart (Recharts) ─────────────────────────────────────────────
@@ -215,25 +224,39 @@ function WeeklyPatternBody({ chartData, title }) {
 
 // ── MostActiveDay7d ────────────────────────────────────────────────────────
 
-export function ModelOverTimeChart({ dailyByModel, modelNames }) {
+type ModelOverTimeChartProps = {
+  dailyByModel?: Array<Record<string, unknown>> | null;
+  modelNames?: string[] | null;
+};
+
+function readStoredTopN(): ModelUsageTopN {
+  if (globalThis.window === undefined) return DEFAULT_MODEL_USAGE_TOP_N;
+  try {
+    return parseModelUsageTopN(globalThis.localStorage.getItem(MODEL_USAGE_TOP_N_STORAGE_KEY));
+  } catch {
+    return DEFAULT_MODEL_USAGE_TOP_N;
+  }
+}
+
+export function ModelOverTimeChart({ dailyByModel, modelNames }: ModelOverTimeChartProps) {
   const t = useTranslations("analytics");
-  const data = useMemo(() => dailyByModel || [], [dailyByModel]);
-  const models = useMemo(() => modelNames || [], [modelNames]);
+  const [topN, setTopNState] = useState<ModelUsageTopN>(readStoredTopN);
 
-  // Prepare chart data — format dates (must be before early return for rules-of-hooks)
-  const chartData = useMemo(() => {
-    return data.map((d) => {
-      const row = { ...d };
-      // Short date label
-      if (d.date) {
-        const parts = d.date.split("-");
-        row.dateLabel = `${parts[1]}/${parts[2]}`;
-      }
-      return row;
-    });
-  }, [data]);
+  const setTopN = useCallback((next: ModelUsageTopN) => {
+    setTopNState(next);
+    try {
+      globalThis.localStorage.setItem(MODEL_USAGE_TOP_N_STORAGE_KEY, String(next));
+    } catch {
+      // Storage can be unavailable (private mode, quota); the choice still applies this session.
+    }
+  }, []);
 
-  if (!data.length || !models.length) {
+  const { rows, series } = useMemo(
+    () => buildModelUsageSeries(dailyByModel, modelNames, topN),
+    [dailyByModel, modelNames, topN]
+  );
+
+  if (!rows.length || !series.length) {
     return (
       <Card className="p-4">
         <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
@@ -244,10 +267,17 @@ export function ModelOverTimeChart({ dailyByModel, modelNames }) {
     );
   }
 
-  return <ModelOverTimeChartBody chartData={chartData} models={models} />;
+  return <ModelOverTimeChartBody rows={rows} series={series} topN={topN} onTopNChange={setTopN} />;
 }
 
-function ModelOverTimeChartBody({ chartData, models }) {
+type ModelOverTimeChartBodyProps = {
+  rows: ModelUsageRow[];
+  series: ModelUsageSeries[];
+  topN: ModelUsageTopN;
+  onTopNChange: (next: ModelUsageTopN) => void;
+};
+
+function ModelOverTimeChartBody({ rows, series, topN, onTopNChange }: ModelOverTimeChartBodyProps) {
   const t = useTranslations("analytics");
   const recharts = useRecharts();
 
@@ -256,14 +286,41 @@ function ModelOverTimeChartBody({ chartData, models }) {
   }
 
   const { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } = recharts;
+  const seriesLabel = (s: ModelUsageSeries) => (s.isOther ? t("chartOther") : s.name);
 
   return (
     <Card className="p-4">
-      <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        {t("chartModelUsageOverTime")}
-      </h3>
+      <div className="flex items-center justify-between gap-2 mb-3">
+        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider">
+          {t("chartModelUsageOverTime")}
+        </h3>
+        <div
+          role="group"
+          aria-label={t("chartTopNLabel")}
+          className="flex items-center gap-0.5 rounded-md border border-border p-0.5"
+        >
+          {MODEL_USAGE_TOP_N_OPTIONS.map((option) => {
+            const pressed = option === topN;
+            return (
+              <button
+                key={String(option)}
+                type="button"
+                aria-pressed={pressed}
+                onClick={() => onTopNChange(option)}
+                className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                  pressed
+                    ? "bg-primary/15 text-primary"
+                    : "text-text-muted hover:text-text-main hover:bg-black/5 dark:hover:bg-white/5"
+                }`}
+              >
+                {option === "all" ? t("chartTopAll") : t("chartTopN", { count: option })}
+              </button>
+            );
+          })}
+        </div>
+      </div>
       <ResponsiveContainer width="100%" height={240}>
-        <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+        <AreaChart data={rows} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
           <XAxis
             dataKey="dateLabel"
             tick={{ fontSize: 10, fill: "var(--color-text-muted)" }}
@@ -279,14 +336,15 @@ function ModelOverTimeChartBody({ chartData, models }) {
             width={50}
           />
           <Tooltip content={<DarkTooltip formatter={fmt} />} />
-          {models.map((m, i) => (
+          {series.map((s) => (
             <Area
-              key={m}
+              key={s.key}
               type="monotone"
-              dataKey={m}
+              dataKey={s.key}
+              name={seriesLabel(s)}
               stackId="1"
-              stroke={getModelColor(i)}
-              fill={getModelColor(i)}
+              stroke={s.color}
+              fill={s.color}
               fillOpacity={0.4}
               strokeWidth={1.5}
               animationDuration={600}
@@ -295,15 +353,25 @@ function ModelOverTimeChartBody({ chartData, models }) {
         </AreaChart>
       </ResponsiveContainer>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-[10px] text-text-muted">
-        {models.map((m, i) => (
-          <span key={m} className="flex items-center gap-1">
+        {series.map((s) => {
+          const label = seriesLabel(s);
+          return (
             <span
-              className="w-2 h-2 rounded-full shrink-0"
-              style={{ backgroundColor: getModelColor(i) }}
-            />
-            {m}
-          </span>
-        ))}
+              key={s.key}
+              data-testid="model-usage-legend-item"
+              className="flex items-center gap-1 max-w-[12rem] min-w-0"
+            >
+              <span
+                aria-hidden="true"
+                className="w-2 h-2 rounded-full shrink-0"
+                style={{ backgroundColor: s.color }}
+              />
+              <span className="truncate" title={label}>
+                {label}
+              </span>
+            </span>
+          );
+        })}
       </div>
     </Card>
   );

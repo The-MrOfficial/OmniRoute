@@ -105,6 +105,8 @@ export type ComboRelayOptions = {
   budgetCap?: number | null;
   /** Per-request X-OmniRoute-Budget-Fallback value ("cheapest" | "strict") — #3470. */
   budgetFallback?: "cheapest" | "strict" | null;
+  /** Per-request X-OmniRoute-Tier ceiling (1-5) — FEAT-005; non-auto filter in combo/tierCeiling.ts. */
+  tierCeiling?: number | null;
   [key: string]: unknown;
 };
 

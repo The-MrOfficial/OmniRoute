@@ -51,7 +51,6 @@ export const KNOWN_CATALOG_ONLY: Record<string, string> = {
   "venice-web": "Web/cookie provider roteado via executor especializado (VeniceWeb).",
   "v0-vercel-web": "Web/cookie provider roteado via executor especializado (V0VercelWeb).",
   "gemini-business": "Enterprise Gemini roteado via executor especializado + baseUrl de conexão.",
-  "ollama-local": "Local provider (Ollama) roteado via baseUrl de conexão; sem registry.",
   "lm-studio": "Local provider (LM Studio) roteado via baseUrl de conexão.",
   vllm: "Local provider (vLLM) roteado via baseUrl de conexão.",
   lemonade: "Local provider roteado via baseUrl de conexão.",

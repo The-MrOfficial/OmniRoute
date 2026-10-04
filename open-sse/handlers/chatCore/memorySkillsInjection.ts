@@ -5,6 +5,7 @@ import {
   toMemoryRetrievalConfig,
 } from "@/lib/memory/settings";
 import { injectMemory, shouldInjectMemory } from "@/lib/memory/injection";
+import { freezeMemories, getFrozenMemories } from "./memoryFreeze.ts";
 import { injectSkillsWithMetadata } from "@/lib/skills/injection";
 import { buildMemoryToolsForProvider } from "@/lib/skills/memoryBuiltins";
 import { skillRegistry } from "@/lib/skills/registry";
@@ -18,6 +19,13 @@ export interface MemorySkillsInjectionResult {
   memorySettings: { enabled: boolean; skillsEnabled: boolean; maxTokens: number } | null;
   builtinToolNames: string[];
   injectedCustomSkillNames: string[];
+  // True only when retrieved memory text was actually merged into the request
+  // body via injectMemory() (owner present, memory enabled, and at least one
+  // memory matched). Surfaced on the empty-output 502 diagnostic so a future
+  // occurrence self-classifies the A<->C question (empty-502 vs injection
+  // corrupting the request). Does NOT flip for memory/skill *tool* injection,
+  // which does not alter the prompt text.
+  memoryInjected: boolean;
 }
 
 function getToolName(tool: unknown): string {
@@ -58,9 +66,15 @@ export async function injectMemoryAndSkills({
   targetFormat,
   backgroundReason,
   log,
+  conversationKey = null,
 }: {
   body: Record<string, unknown>;
   memoryOwnerId: string | null;
+  /**
+   * Stable per-conversation id. When set, memories retrieved on the first request
+   * are frozen and re-injected unchanged on later turns (prefix-cache stability).
+   */
+  conversationKey?: string | null;
   provider: string;
   effectiveModel: string;
   sourceFormat: string;
@@ -74,6 +88,7 @@ export async function injectMemoryAndSkills({
 
   const builtinOwnerSet: string[] = [];
   const injectedCustomSkillNames: string[] = [];
+  let memoryInjected = false;
 
   if (
     memoryOwnerId &&
@@ -145,10 +160,20 @@ export async function injectMemoryAndSkills({
         return "";
       })();
 
-      const memories = await retrieveMemories(
-        memoryOwnerId,
-        toMemoryRetrievalConfig(memorySettings, { query: lastUserQuery })
-      );
+      // Prefix stability: reuse the conversation's first retrieval verbatim so the
+      // injected text never changes mid-conversation (see memoryFreeze.ts).
+      const frozenMemories = conversationKey
+        ? getFrozenMemories(memoryOwnerId, conversationKey)
+        : null;
+      const memories =
+        frozenMemories ??
+        (await retrieveMemories(
+          memoryOwnerId,
+          toMemoryRetrievalConfig(memorySettings, { query: lastUserQuery })
+        ));
+      if (conversationKey && !frozenMemories) {
+        freezeMemories(memoryOwnerId, conversationKey, memories);
+      }
       if (memories.length > 0) {
         // #3890: when the client uses prompt caching (cache_control breakpoints), inject
         // memory cache-safely (before the last user message) so the per-query memory text
@@ -161,6 +186,7 @@ export async function injectMemoryAndSkills({
           { cacheSafe }
         );
         body = injected as typeof body;
+        memoryInjected = true;
         log?.debug?.("MEMORY", `Injected ${memories.length} memories for key=${memoryOwnerId}`);
       }
     } catch (memErr) {
@@ -261,7 +287,13 @@ export async function injectMemoryAndSkills({
     };
   }
 
-  return { body, memorySettings, builtinToolNames: builtinOwnerSet, injectedCustomSkillNames };
+  return {
+    body,
+    memorySettings,
+    builtinToolNames: builtinOwnerSet,
+    injectedCustomSkillNames,
+    memoryInjected,
+  };
 }
 
 interface FallbackPlan {

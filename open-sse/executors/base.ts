@@ -30,6 +30,7 @@ import {
   addParamToBlocklist,
   isAutoLearnGloballyEnabled,
 } from "@/lib/db/paramFilters";
+import { getCachedReasoningEffortsOverride } from "@/lib/db/modelCapabilityOverrides";
 import { applyFingerprint, isCliCompatEnabled, stripInternalBodyFields } from "../config/cliFingerprints.ts"; // prettier-ignore
 import { supportsClaudeMaxEffort, supportsXHighEffort } from "../config/providerModels.ts";
 import { getThinkingBudgetConfig, ThinkingMode } from "../services/thinkingBudget.ts";
@@ -901,7 +902,8 @@ export class BaseExecutor {
         rawTransformedBody,
         this.provider,
         model,
-        log
+        log,
+        getCachedReasoningEffortsOverride
       );
       if (this.provider === "groq") {
         transformedBody = stripGroqUnsupportedFields(

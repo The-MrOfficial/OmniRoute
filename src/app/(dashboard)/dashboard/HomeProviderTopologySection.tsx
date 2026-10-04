@@ -15,6 +15,10 @@ type TopologyProvider = {
   name?: string;
   /** Connection-health base state, so the topology can colour a node at rest. */
   status?: "active" | "error" | "idle";
+  /** Extra ids matched against live/last/error sets (provider-node row id). */
+  aliases?: string[];
+  /** Click-through id (provider-node row id). */
+  routeId?: string;
 };
 
 export function HomeProviderTopologySection({

@@ -987,6 +987,9 @@ export function getResolvedModelCapabilities(
   };
 }
 
+export type InputTokenCapSource =
+  "combo-policy" | "override" | "combo-context-override" | "catalog";
+
 /**
  * Input cap enforced at the request-time hard gate, with explicit combo semantics.
  *
@@ -997,9 +1000,10 @@ export function getResolvedModelCapabilities(
  * around and reject the rescued target on the very hint the filter bypassed.
  *
  * Semantics (deliberately narrow — NO suffix/effort/family inheritance):
- * - An explicit `max_input_tokens` capability override is ALWAYS enforced, for
- *   direct and combo requests alike. It is the operator's input-only ceiling and
- *   must never be bypassed by a context-window override.
+ * - An explicit `max_input_tokens` capability override is enforced for direct
+ *   and combo requests alike, unless a combo per-target policy applies (below).
+ *   It is the operator's input-only ceiling and must never be bypassed by a
+ *   context-window override.
  * - Otherwise, for a COMBO request with an exact persisted context override, that
  *   context override is the input cap (it reflects the real window; the smaller
  *   catalog hint does not apply). Direct requests ignore this branch.
@@ -1007,29 +1011,82 @@ export function getResolvedModelCapabilities(
  *   authoritative window → synced limit_input → total window), clamped to the
  *   total window.
  *
+ * Combo per-target policy (highest precedence, COMBO requests only): when the
+ * dispatching combo (or a nested combo containing the target) declares
+ * `config.weightedTargetPolicies["<provider>/<model>"].maxInputTokens`, that
+ * policy is the input cap. It is the operator's most specific statement about
+ * this target in this combo, so it outranks the generic, target-wide
+ * `max_input_tokens` override (which otherwise shadowed it entirely). It is
+ * always bounded by the target's own known context window minus the output
+ * reserve (`outputReserveTokens`, clamped to window/4), so a policy larger than
+ * the real window can never admit a prompt the model cannot hold. Direct
+ * (non-combo) requests ignore the policy and keep the override as never-bypassed.
+ *
  * `isCombo` selects the combo-rescue branch; pass `false`/omit for direct calls.
  * The returned cap is still only an *input* bound — the total-window/output
  * reserve check is enforced separately by `enforceOutputTokenBudget`.
  */
-export function resolveInputTokenCapForGate(
+export function resolveInputTokenCapForGateWithSource(
   input: CapabilityInput,
-  { isCombo = false }: { isCombo?: boolean } = {}
-): number | null {
+  {
+    isCombo = false,
+    comboTargetInputPolicy = null,
+    outputReserveTokens = 0,
+  }: {
+    isCombo?: boolean;
+    comboTargetInputPolicy?: number | null;
+    outputReserveTokens?: number | null;
+  } = {}
+): { cap: number | null; source: InputTokenCapSource } {
   const resolved = resolveCapabilityInput(input);
+
+  // 0. Combo per-target policy, bounded by the real window minus the output reserve.
+  if (
+    isCombo &&
+    typeof comboTargetInputPolicy === "number" &&
+    Number.isFinite(comboTargetInputPolicy) &&
+    comboTargetInputPolicy > 0
+  ) {
+    const policy = Math.floor(comboTargetInputPolicy);
+    const contextWindow = getResolvedModelCapabilities(input).contextWindow;
+    if (typeof contextWindow === "number" && contextWindow > 0) {
+      const requestedReserve =
+        typeof outputReserveTokens === "number" && Number.isFinite(outputReserveTokens)
+          ? Math.max(0, Math.floor(outputReserveTokens))
+          : 0;
+      const reserve = Math.min(requestedReserve, Math.floor(contextWindow / 4));
+      return {
+        cap: Math.min(policy, Math.max(1, contextWindow - reserve)),
+        source: "combo-policy",
+      };
+    }
+    return { cap: policy, source: "combo-policy" };
+  }
 
   // 1. An explicit `max_input_tokens` override always wins and is never bypassed.
   const explicitInputOverride = getInputTokenCapabilityOverride(resolved);
-  if (explicitInputOverride !== null) return explicitInputOverride;
+  if (explicitInputOverride !== null) return { cap: explicitInputOverride, source: "override" };
 
   // 2. Combo rescue: an exact persisted context override supersedes the smaller
   //    catalog/client input hint (mirrors contextOverrideGate.evaluateContextLimit).
   if (isCombo) {
     const contextOverride = getContextOverride(resolved);
-    if (contextOverride !== null) return contextOverride;
+    if (contextOverride !== null) return { cap: contextOverride, source: "combo-context-override" };
   }
 
   // 3. Canonical chain (already clamped to the total window by the resolver).
-  return getResolvedModelCapabilities(input).maxInputTokens;
+  return { cap: getResolvedModelCapabilities(input).maxInputTokens, source: "catalog" };
+}
+
+export function resolveInputTokenCapForGate(
+  input: CapabilityInput,
+  options: {
+    isCombo?: boolean;
+    comboTargetInputPolicy?: number | null;
+    outputReserveTokens?: number | null;
+  } = {}
+): number | null {
+  return resolveInputTokenCapForGateWithSource(input, options).cap;
 }
 
 export function supportsToolCalling(input: CapabilityInput): boolean {

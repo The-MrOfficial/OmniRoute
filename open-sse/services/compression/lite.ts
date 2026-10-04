@@ -19,6 +19,8 @@ interface LiteCompressionOptions {
   preserveSystemPrompt?: boolean;
   compressToolResults?: boolean;
   maxToolLength?: number;
+  /** Effective compression config; only `prefixCacheSensitive` is read here. */
+  config?: { prefixCacheSensitive?: boolean };
 }
 
 const DEFAULT_MAX_TOOL_LENGTH = 2000;
@@ -262,7 +264,12 @@ export function applyLiteCompression(
   current = r2.body;
   if (r2.applied) techniquesApplied.push("system-dedup");
 
-  if (options?.compressToolResults !== false) {
+  // Tool-result truncation exempts the current turn and truncates it once a newer
+  // turn exists, so it rewrites already-sent bytes on the next request. Upstreams
+  // that only reuse a byte-identical prefix (resolveCacheAwareConfig sets
+  // prefixCacheSensitive) would re-prefill from that point, so this hard gate wins
+  // over any global or per-step compressToolResults: true.
+  if (options?.compressToolResults !== false && options?.config?.prefixCacheSensitive !== true) {
     const r3 = compressToolResults(current, options);
     current = r3.body;
     if (r3.applied) techniquesApplied.push("tool-compress");

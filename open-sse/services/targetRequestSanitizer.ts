@@ -9,6 +9,7 @@
 
 import { stripUnsupportedParams } from "../translator/paramSupport.ts";
 import { sanitizeReasoningEffortForProvider } from "../executors/base/reasoningEffort.ts";
+import { getCachedReasoningEffortsOverride } from "@/lib/db/modelCapabilityOverrides";
 
 type JsonRecord = Record<string, unknown>;
 type LoggerLike =
@@ -96,7 +97,8 @@ export function sanitizeRequestForResolvedTarget<T extends JsonRecord>(
     next,
     options.provider || "",
     options.model,
-    options.log
+    options.log,
+    getCachedReasoningEffortsOverride
   ) as T;
 
   // Apply operator-configured provider/model filters at the common dispatch

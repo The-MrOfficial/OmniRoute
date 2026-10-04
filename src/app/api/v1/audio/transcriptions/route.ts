@@ -29,6 +29,10 @@ import { getDatabaseSettings } from "@/lib/db/databaseSettings";
 import { handleComboChat } from "@omniroute/open-sse/services/combo.ts";
 import { log } from "@omniroute/open-sse/utils/logger.ts";
 import { saveCallLog } from "@/lib/usageDb";
+import {
+  beginLiveRequest,
+  runLiveRequestTail,
+} from "@omniroute/open-sse/utils/liveRequestLifecycle.ts";
 
 /**
  * Best-effort peek at a successful transcription response for upstream duration
@@ -124,8 +128,9 @@ async function transcribeWithModel(
     credentials = await getProviderCredentialsWithQuotaPreflight(credentialKey);
     // Prefix match wins (`deepgram/nova-3` → native Deepgram). If that
     // provider has no credentials, retry gateways that list the same nested
-    // model id (e.g. OpenRouter's `deepgram/nova-3`).
-    if (!credentials) {
+    // model id (e.g. OpenRouter's `deepgram/nova-3`). An allowlisted local node
+    // (`credentialsOptional`) is the intended target, so it never falls back.
+    if (!credentials && !providerConfig.credentialsOptional) {
       const candidates = audioModelAliasCandidates(modelStr, provider, resolvedModel);
       const alternate = findAlternateAudioProvider(
         AUDIO_TRANSCRIPTION_PROVIDERS,
@@ -144,7 +149,7 @@ async function transcribeWithModel(
         }
       }
     }
-    if (!credentials) {
+    if (!credentials && !providerConfig.credentialsOptional) {
       const candidates = audioModelAliasCandidates(modelStr, provider, resolvedModel);
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
@@ -154,65 +159,83 @@ async function transcribeWithModel(
         )
       );
     }
-    if (isAllRateLimitedCredentials(credentials)) {
+    if (credentials && isAllRateLimitedCredentials(credentials)) {
       return rateLimitedProviderResponse(provider, credentials);
     }
   }
 
-  let response = await handleAudioTranscription({
-    formData,
-    credentials,
-    resolvedProvider: providerConfig,
-    resolvedModel,
-  });
-
-  const connectionId = (credentials as { connectionId?: string } | null)?.connectionId || undefined;
-  const logModel = `${provider}/${resolvedModel}`;
-
-  if (response?.ok) {
-    await clearRecoveredProviderState(credentials);
-    const durationUsage = await peekDurationUsage(response);
-    // No per-second pricing rule exists yet for transcription duration → cost 0
-    // (ADD-only headers, body intact). The upstream usage is still persisted on
-    // the call_logs row below so it is auditable ahead of that pricing rule.
-    response = attachOmniRouteMetaToResponse(response, {
-      provider,
-      model: resolvedModel,
-      costUsd: 0,
-      latencyMs: Date.now() - startTime,
-      requestId: generateRequestId(),
+  // Live dashboard lifecycle (topology "active" state), paired started → completed/failed.
+  const live = beginLiveRequest({ provider, model: resolvedModel || modelStr });
+  let response: Awaited<ReturnType<typeof handleAudioTranscription>>;
+  try {
+    response = await handleAudioTranscription({
+      formData,
+      credentials,
+      resolvedProvider: providerConfig,
+      resolvedModel,
     });
-    saveCallLog({
-      method: "POST",
-      path: "/v1/audio/transcriptions",
-      status: 200,
-      model: logModel,
-      provider,
-      connectionId,
-      duration: Date.now() - startTime,
-      responseBody: durationUsage ? { usage: durationUsage } : undefined,
-      apiKeyId: apiKeyId || undefined,
-      apiKeyName: apiKeyName || undefined,
-    }).catch(() => {});
-  } else if (response) {
-    const errorText = await response
-      .clone()
-      .text()
-      .catch(() => "");
-    saveCallLog({
-      method: "POST",
-      path: "/v1/audio/transcriptions",
-      status: response.status,
-      model: logModel,
-      provider,
-      connectionId,
-      duration: Date.now() - startTime,
-      error: errorText.slice(0, 500),
-      apiKeyId: apiKeyId || undefined,
-      apiKeyName: apiKeyName || undefined,
-    }).catch(() => {});
+  } catch (error) {
+    live.finish({ status: 500, error: error instanceof Error ? error.message : String(error) });
+    throw error;
   }
-  return response;
+  if (!response) live.finish({ status: 502, error: "No response" });
+
+  // A throw anywhere in the post-processing tail must still finish the live request.
+  return runLiveRequestTail(live, async () => {
+    const connectionId =
+      (credentials as { connectionId?: string } | null)?.connectionId || undefined;
+    const logModel = `${provider}/${resolvedModel}`;
+
+    if (response?.ok) {
+      await clearRecoveredProviderState(credentials);
+      const durationUsage = await peekDurationUsage(response);
+      // No per-second pricing rule exists yet for transcription duration → cost 0
+      // (ADD-only headers, body intact). The upstream usage is still persisted on
+      // the call_logs row below so it is auditable ahead of that pricing rule.
+      response = attachOmniRouteMetaToResponse(response, {
+        provider,
+        model: resolvedModel,
+        costUsd: 0,
+        latencyMs: Date.now() - startTime,
+        requestId: generateRequestId(),
+      });
+      saveCallLog({
+        method: "POST",
+        path: "/v1/audio/transcriptions",
+        status: 200,
+        model: logModel,
+        provider,
+        connectionId,
+        duration: Date.now() - startTime,
+        responseBody: durationUsage ? { usage: durationUsage } : undefined,
+        apiKeyId: apiKeyId || undefined,
+        apiKeyName: apiKeyName || undefined,
+      }).catch(() => {});
+      live.finish({ status: 200 });
+    } else if (response) {
+      const errorText = await response
+        .clone()
+        .text()
+        .catch(() => "");
+      saveCallLog({
+        method: "POST",
+        path: "/v1/audio/transcriptions",
+        status: response.status,
+        model: logModel,
+        provider,
+        connectionId,
+        duration: Date.now() - startTime,
+        error: errorText.slice(0, 500),
+        apiKeyId: apiKeyId || undefined,
+        apiKeyName: apiKeyName || undefined,
+      }).catch(() => {});
+      live.finish({
+        status: response.status,
+        error: errorText.slice(0, 500) || `HTTP ${response.status}`,
+      });
+    }
+    return response;
+  });
 }
 
 /**

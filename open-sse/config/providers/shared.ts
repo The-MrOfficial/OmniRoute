@@ -64,6 +64,16 @@ export interface RegistryModel {
    */
   alwaysReasons?: boolean;
   supportedThinkingEfforts?: readonly string[];
+  /**
+   * When true, a reasoning_effort request ABOVE this model's declared
+   * `supportedThinkingEfforts` ceiling is DROPPED entirely (field omitted)
+   * instead of being clamped down to the declared ceiling. For backends whose
+   * chat template exposes its top tier only as the OMITTED default and rejects
+   * every explicit spelling of that top tier (see
+   * `RegistryEntry.omitEffortAboveDeclaredCeiling`). Values at or below the
+   * ceiling still pass through / clamp normally.
+   */
+  omitEffortAboveDeclaredCeiling?: boolean;
   supportsVision?: boolean;
   supportsAudio?: boolean;
   supportsVideo?: boolean;
@@ -171,6 +181,18 @@ export interface RegistryEntry {
   /** Provider-native reasoning vocabulary for reasoning-capable passthrough models
    * that do not have an explicit per-model declaration. */
   defaultSupportedThinkingEfforts?: readonly string[];
+  /**
+   * Provider-level counterpart to `RegistryModel.omitEffortAboveDeclaredCeiling`,
+   * applied when the matched vocabulary came from `defaultSupportedThinkingEfforts`
+   * (passthrough models with no per-model declaration). When true, a
+   * reasoning_effort request above the declared ceiling is DROPPED (field
+   * omitted) rather than clamped down — the backend's chat template then applies
+   * its own default top tier. Needed for self-hosted templates (e.g. the
+   * ollama-local qwen3.5/qwen3.8 family) that advertise a top tier only as the
+   * OMITTED default and raise on every explicit spelling of it (including the
+   * literal `xhigh` the template internally rewrites to `max` and then rejects).
+   */
+  omitEffortAboveDeclaredCeiling?: boolean;
   modelsUrl?: string;
   /** Prefix to prepend to model IDs before upstream API calls (e.g. "accounts/fireworks/models/") */
   modelIdPrefix?: string;

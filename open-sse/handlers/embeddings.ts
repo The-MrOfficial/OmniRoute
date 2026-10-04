@@ -20,6 +20,7 @@ import { getCallLogPipelineCaptureStreamChunks } from "@/lib/logEnv";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { stripStaleEncodingHeaders } from "../utils/upstreamResponseHeaders.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
+import { beginLiveRequest } from "../utils/liveRequestLifecycle.ts";
 import { stripTrailingSlashes } from "../utils/urlSanitize.ts";
 import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { fetchRemoteImage } from "@/shared/network/remoteImageFetch";
@@ -29,6 +30,15 @@ import {
   prepareJinaMixedEmbeddingInput,
   prepareStructuredEmbeddingRequest,
 } from "./embeddingStructuredInput.ts";
+import {
+  capEmbeddingItems,
+  mergeEmbeddingBatchResponses,
+  planEmbeddingBatches,
+  resolveEmbeddingItemOverflowMode,
+  resolveEmbeddingSplitLimits,
+  type EmbeddingBatchPart,
+  type EmbeddingBatchRange,
+} from "./embeddingBatchSplit.ts";
 import { MAX_EMBEDDING_INLINE_ITEM_BYTES } from "@/shared/validation/schemas/apiV1";
 import { markAccountUnavailable } from "../../src/sse/services/auth.ts";
 import {
@@ -55,6 +65,7 @@ interface EmbeddingCredentials {
 
 interface EmbeddingLog {
   info: (...args: unknown[]) => void;
+  warn?: (...args: unknown[]) => void;
   error: (...args: unknown[]) => void;
 }
 
@@ -68,6 +79,14 @@ interface HandleEmbeddingParams {
   apiKeyId?: string | null;
   apiKeyName?: string | null;
   connectionId?: string | null;
+  /** Client request signal; a split request stops sending sub-batches once it aborts. */
+  signal?: AbortSignal | null;
+  /**
+   * Set only by OmniRoute's own callers (memory embedder, Qdrant). Under the
+   * default `auto` overflow mode an over-cap item is truncated for them and
+   * rejected with 400 for everyone else.
+   */
+  internalCaller?: boolean;
 }
 
 interface EmbeddingFailure {
@@ -533,15 +552,180 @@ async function dispatchEmbeddingRequest(
   });
 }
 
+interface PlannedSubBatch extends EmbeddingBatchRange {
+  /** Set on halves produced by a 5xx/network re-split; they are never split again. */
+  resplit: boolean;
+}
+
+interface DispatchedEmbedding {
+  response: Response;
+  requestCount: number;
+}
+
+/** Prompt tokens already spent by sub-batches that succeeded before a split request failed. */
+interface SplitProgress {
+  promptTokens: number;
+}
+
+/** The client went away mid-split; remaining sub-batches are not sent. */
+class EmbeddingClientAbortError extends Error {
+  constructor(sent: number, total: number) {
+    super(`Client disconnected after ${sent}/${total} embedding sub-batches`);
+    this.name = "EmbeddingClientAbortError";
+  }
+}
+
+function usagePromptTokens(body: Record<string, unknown>): number {
+  const usage = (body.usage ?? {}) as { prompt_tokens?: number; total_tokens?: number };
+  return usage.prompt_tokens || usage.total_tokens || 0;
+}
+
+/** Split plan for an oversized plain text/token array, or null to forward it unchanged. */
+function resolveSplitPlan(
+  runtime: EmbeddingRuntime,
+  prepared: PreparedEmbeddingRequest
+): EmbeddingBatchRange[] | null {
+  // Native/structured transports rewrite the body into a provider shape; leave them alone.
+  if (prepared.normalizeProviderResponse) return null;
+  const limits = resolveEmbeddingSplitLimits(runtime.provider);
+  return limits ? planEmbeddingBatches(prepared.upstreamBody.input, limits) : null;
+}
+
+/**
+ * Per-item token guard for split providers (arc-embed / ovms-arc by default).
+ * Runs before any dispatch, so no upstream request, sub-batch, halved re-split,
+ * or combo target ever carries an item over the cap — a timed-out or 5xx
+ * request is therefore never resent with the same oversized item. Truncates
+ * (with a warning) or rejects with 400 per OMNIROUTE_EMBEDDING_ITEM_OVERFLOW;
+ * `auto` truncates internal callers and rejects external ones.
+ */
+function applyEmbeddingItemCap(
+  runtime: EmbeddingRuntime,
+  prepared: PreparedEmbeddingRequest
+): EmbeddingFailure | null {
+  if (prepared.normalizeProviderResponse) return null;
+  const limits = resolveEmbeddingSplitLimits(runtime.provider);
+  if (!limits) return null;
+  const { input, overflows } = capEmbeddingItems(prepared.upstreamBody.input, limits.maxItemTokens);
+  if (overflows.length === 0) return null;
+  const mode = resolveEmbeddingItemOverflowMode();
+  const truncate = mode === "truncate" || (mode === "auto" && runtime.internalCaller === true);
+  const largest = overflows.reduce((max, item) =>
+    item.estimatedTokens > max.estimatedTokens ? item : max
+  );
+  if (!truncate) {
+    return failure(
+      400,
+      `Embedding input item ${largest.index} is ~${largest.estimatedTokens} tokens, over the ${limits.maxItemTokens}-token per-item limit for ${runtime.provider}; split the input or set OMNIROUTE_EMBEDDING_ITEM_OVERFLOW=truncate`
+    );
+  }
+  prepared.upstreamBody.input = input;
+  (runtime.log?.warn ?? runtime.log?.info)?.(
+    "EMBED",
+    `${runtime.provider}/${runtime.model} | truncated ${overflows.length} input item(s) to the ${limits.maxItemTokens}-token per-item cap (largest ~${largest.estimatedTokens} tokens)`
+  );
+  return null;
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "TimeoutError" ||
+      error.name === "AbortError" ||
+      error.message.toLowerCase().includes("timeout"))
+  );
+}
+
+function halveSubBatch(batch: PlannedSubBatch): PlannedSubBatch[] {
+  const middle = batch.start + Math.ceil((batch.end - batch.start) / 2);
+  return [
+    { start: batch.start, end: middle, resplit: true },
+    { start: middle, end: batch.end, resplit: true },
+  ];
+}
+
+/**
+ * Send planned sub-batches sequentially and merge them into one response. A
+ * sub-batch that fails with 5xx or a connection error is not resent as-is: it
+ * is split in half once and each half is tried once. Any other failure ends
+ * the request with that upstream response. The client signal is checked
+ * before each sub-batch, and `progress` tracks tokens already spent so a
+ * failure row can record them.
+ */
+async function fetchSplitEmbeddingBatches(
+  runtime: EmbeddingRuntime,
+  prepared: PreparedEmbeddingRequest,
+  batches: EmbeddingBatchRange[],
+  progress: SplitProgress
+): Promise<DispatchedEmbedding> {
+  const input = prepared.upstreamBody.input as unknown[];
+  runtime.log?.info(
+    "EMBED",
+    `${runtime.provider}/${runtime.model} | splitting ${input.length} items into ${batches.length} sub-requests`
+  );
+  const queue: PlannedSubBatch[] = batches.map((batch) => ({ ...batch, resplit: false }));
+  const parts: EmbeddingBatchPart[] = [];
+  let lastHeaders = new Headers();
+  // Quota counts one logical call, matching the unsplit request it replaces.
+  const requestCount = 1;
+  for (let position = 0; position < queue.length; position++) {
+    if (runtime.signal?.aborted) throw new EmbeddingClientAbortError(position, queue.length);
+    const batch = queue[position];
+    const canResplit = !batch.resplit && batch.end - batch.start > 1;
+    const subBody = { ...prepared.upstreamBody, input: input.slice(batch.start, batch.end) };
+    let response: Response;
+    try {
+      response = await dispatchEmbeddingRequest(
+        { ...prepared, upstreamBody: subBody },
+        null,
+        runtime.reqLogger
+      );
+    } catch (error) {
+      if (!canResplit || isTimeoutError(error)) throw error;
+      runtime.log?.error(
+        "EMBED",
+        `${runtime.provider} sub-batch [${batch.start},${batch.end}) failed (${sanitizeErrorMessage(error)}); splitting once`
+      );
+      queue.splice(position + 1, 0, ...halveSubBatch(batch));
+      continue;
+    }
+    if (!response.ok) {
+      if (response.status < 500 || !canResplit) return { response, requestCount };
+      await response.body?.cancel().catch(() => {});
+      runtime.log?.error(
+        "EMBED",
+        `${runtime.provider} sub-batch [${batch.start},${batch.end}) returned ${response.status}; splitting once`
+      );
+      queue.splice(position + 1, 0, ...halveSubBatch(batch));
+      continue;
+    }
+    lastHeaders = response.headers;
+    const body = (await response.json()) as Record<string, unknown>;
+    progress.promptTokens += usagePromptTokens(body);
+    parts.push({ offset: batch.start, body });
+  }
+  const merged = mergeEmbeddingBatchResponses(parts);
+  return {
+    response: new Response(JSON.stringify(merged), { status: 200, headers: lastHeaders }),
+    requestCount,
+  };
+}
+
 function pipelinePayloads(
   runtime: EmbeddingRuntime
 ): ReturnType<RequestLogger["getPipelinePayloads"]> | null {
   return runtime.detailedLoggingEnabled ? runtime.reqLogger.getPipelinePayloads() : null;
 }
 
+/** call_logs tokens for a failed request: only what earlier split sub-batches spent. */
+function partialTokens(promptTokens: number) {
+  return promptTokens > 0 ? { tokens: { prompt_tokens: promptTokens, completion_tokens: 0 } } : {};
+}
+
 async function handleUpstreamFailure(
   runtime: EmbeddingRuntime,
-  response: Response
+  response: Response,
+  partialPromptTokens = 0
 ): Promise<EmbeddingFailure> {
   const errorText = await response.text();
   runtime.log?.error(
@@ -564,6 +748,7 @@ async function handleUpstreamFailure(
     model: `${runtime.provider}/${runtime.model}`,
     provider: runtime.provider,
     duration: Date.now() - runtime.startTime,
+    ...partialTokens(partialPromptTokens),
     error: errorText.slice(0, 500),
     requestBody: runtime.logRequestBody,
     pipelinePayloads: pipelinePayloads(runtime),
@@ -689,7 +874,8 @@ async function handleUpstreamSuccess(
 function handleEmbeddingException(
   runtime: EmbeddingRuntime,
   prepared: PreparedEmbeddingRequest,
-  error: unknown
+  error: unknown,
+  partialPromptTokens = 0
 ): EmbeddingFailure {
   const message = error instanceof Error ? error.message : String(error);
   const isTimeout =
@@ -697,7 +883,8 @@ function handleEmbeddingException(
     (error.name === "TimeoutError" ||
       error.name === "AbortError" ||
       message.toLowerCase().includes("timeout"));
-  const status = isTimeout ? 504 : 502;
+  const isClientAbort = error instanceof EmbeddingClientAbortError;
+  const status = isClientAbort ? 499 : isTimeout ? 504 : 502;
   runtime.log?.error("EMBED", `${runtime.provider} fetch error: ${message}`);
   runtime.reqLogger.logError(error, prepared.upstreamBody);
   saveCallLog({
@@ -707,6 +894,7 @@ function handleEmbeddingException(
     model: `${runtime.provider}/${runtime.model}`,
     provider: runtime.provider,
     duration: Date.now() - runtime.startTime,
+    ...partialTokens(partialPromptTokens),
     error: message,
     requestBody: runtime.logRequestBody,
     pipelinePayloads: pipelinePayloads(runtime),
@@ -726,13 +914,20 @@ async function executeEmbedding(
   const singleTextsOrFailure = resolveSingleTexts(runtime);
   if (singleTextsOrFailure && !Array.isArray(singleTextsOrFailure)) return singleTextsOrFailure;
   const singleTexts = Array.isArray(singleTextsOrFailure) ? singleTextsOrFailure : null;
+  const splitPlan = singleTexts ? null : resolveSplitPlan(runtime, prepared);
+  const progress: SplitProgress = { promptTokens: 0 };
   try {
-    const response = await dispatchEmbeddingRequest(prepared, singleTexts, runtime.reqLogger);
+    const { response, requestCount } = splitPlan
+      ? await fetchSplitEmbeddingBatches(runtime, prepared, splitPlan, progress)
+      : {
+          response: await dispatchEmbeddingRequest(prepared, singleTexts, runtime.reqLogger),
+          requestCount: singleTexts?.length ?? 1,
+        };
     return response.ok
-      ? handleUpstreamSuccess(runtime, prepared, response, singleTexts?.length ?? 1)
-      : handleUpstreamFailure(runtime, response);
+      ? handleUpstreamSuccess(runtime, prepared, response, requestCount)
+      : handleUpstreamFailure(runtime, response, progress.promptTokens);
   } catch (error) {
-    return handleEmbeddingException(runtime, prepared, error);
+    return handleEmbeddingException(runtime, prepared, error, progress.promptTokens);
   }
 }
 
@@ -745,11 +940,30 @@ export async function handleEmbedding(params: HandleEmbeddingParams): Promise<Em
   if (modalityFailure) return modalityFailure;
   const prepared = await prepareEmbeddingRequest(runtime);
   if ("success" in prepared) return prepared;
+  const capFailure = applyEmbeddingItemCap(runtime, prepared);
+  if (capFailure) return capFailure;
   runtime.log?.info(
     "EMBED",
     `${runtime.provider}/${runtime.model} | input: ${
       Array.isArray(runtime.body.input) ? `${runtime.body.input.length} items` : "1 item"
     }`
   );
-  return executeEmbedding(runtime, prepared);
+  // Live dashboard lifecycle (topology "active" state), paired started → completed/failed.
+  const live = beginLiveRequest({
+    provider: runtime.provider,
+    model: runtime.model || String(runtime.body.model ?? ""),
+  });
+  let result: EmbeddingResult;
+  try {
+    result = await executeEmbedding(runtime, prepared);
+  } catch (error) {
+    live.finish({ status: 500, error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+  live.finish(
+    result.success
+      ? { status: 200, tokens: result.data.usage }
+      : { status: result.status, error: result.error }
+  );
+  return result;
 }

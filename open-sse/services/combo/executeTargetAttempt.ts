@@ -85,7 +85,10 @@ import {
 } from "./quotaExhaustion.ts";
 import { markAccountExhaustedFromCredits } from "../../../src/domain/quotaCache.ts";
 import { classifyComboOutcome, redactConnectionLabel } from "./comboErrorAggregation.ts";
-import { readConnectionForCooldownGate } from "./executeTargetGates.ts";
+import {
+  isPrefixCacheSensitiveTarget,
+  readConnectionForCooldownGate,
+} from "./executeTargetGates.ts";
 import { recordLkgpPin } from "./recordLkgpPin.ts";
 import {
   buildComboDiag,
@@ -271,22 +274,31 @@ export async function executeTargetAttempt(opts: {
       // #7847: object, not JSON.stringify — the string branch mis-counts inline images.
       const estimatedTokens = estimateTokens(attemptBody);
       if (estimatedTokens > (deps.config.fallbackCompressionThreshold ?? 1000)) {
-        const { applyCompression } = await import("../compression/strategySelector.ts");
-        const compressionResult = applyCompression(
-          attemptBody,
-          deps.config.fallbackCompressionMode as CompressionMode,
-          // Opt into the TV1 bail-out so a throwing fallback engine is SKIPPED rather than
-          // propagating out of executeTarget and being swallowed as a "Speculative task
-          // error" (which silently drops this combo target). minGainPercent:0 keeps the
-          // advance behavior identical to the default path — this only adds skip-on-throw.
-          { model: modelStr, bailout: { enabled: true, minGainPercent: 0 } }
-        );
-        if (compressionResult.compressed) {
+        // Prefix-cache gate: a llama-cpp/ds4 fallback target keeps the byte-stable prefix;
+        // its own chatCore compression still applies the gated (cache-aware) config.
+        if (await isPrefixCacheSensitiveTarget(target)) {
           deps.log.info(
             "COMBO",
-            `Proactive fallback compression applied (${deps.config.fallbackCompressionMode}): ${estimatedTokens} -> ${compressionResult.stats?.compressedTokens} tokens`
+            `Skipping proactive fallback compression for prefix-cache-sensitive target ${modelStr}`
           );
-          attemptBody = compressionResult.body;
+        } else {
+          const { applyCompression } = await import("../compression/strategySelector.ts");
+          const compressionResult = applyCompression(
+            attemptBody,
+            deps.config.fallbackCompressionMode as CompressionMode,
+            // Opt into the TV1 bail-out so a throwing fallback engine is SKIPPED rather than
+            // propagating out of executeTarget and being swallowed as a "Speculative task
+            // error" (which silently drops this combo target). minGainPercent:0 keeps the
+            // advance behavior identical to the default path — this only adds skip-on-throw.
+            { model: modelStr, bailout: { enabled: true, minGainPercent: 0 } }
+          );
+          if (compressionResult.compressed) {
+            deps.log.info(
+              "COMBO",
+              `Proactive fallback compression applied (${deps.config.fallbackCompressionMode}): ${estimatedTokens} -> ${compressionResult.stats?.compressedTokens} tokens`
+            );
+            attemptBody = compressionResult.body;
+          }
         }
       }
     }

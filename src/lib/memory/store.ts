@@ -144,6 +144,7 @@ function scheduleVectorUpsert(id: string, content: string): void {
         log.warn("memory.vec.embed.fail", {
           id,
           reason: embeddingResult.reason,
+          status: embeddingResult.status,
           message: sanitizeErrorMessage(embeddingResult.message),
         });
         safeMarkNeedsReindex(id, true);

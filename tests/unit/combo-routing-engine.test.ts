@@ -1604,6 +1604,48 @@ test("handleComboChat applies fallback compression only after explicit zero-late
   assert.match(fallbackToolContent, /truncated/i);
 });
 
+test("handleComboChat skips fallback compression for a prefix-cache-sensitive (llama-cpp) fallback target", async () => {
+  const longToolOutput = "x".repeat(2500);
+  let fallbackBody: { messages: Array<{ content: unknown }> } | null = null;
+  const result = await handleComboChat({
+    body: {
+      messages: [
+        { role: "user", content: "please inspect this output" },
+        { role: "tool", content: longToolOutput },
+      ],
+    },
+    combo: {
+      name: "zero-latency-skips-prefix-sensitive-fallback",
+      strategy: "priority",
+      models: ["provider-a/model-a", "llama-cpp/glm-5.3"],
+      config: {
+        maxRetries: 0,
+        retryDelayMs: 1,
+        zeroLatencyOptimizationsEnabled: true,
+        fallbackCompressionMode: "lite",
+        fallbackCompressionThreshold: 1,
+      },
+    },
+    handleSingleModel: async (
+      requestBody: { messages: Array<{ content: unknown }> },
+      modelStr: string
+    ) => {
+      if (modelStr === "provider-a/model-a") {
+        return errorResponse(500, "first target failed");
+      }
+      fallbackBody = requestBody;
+      return okResponse();
+    },
+    isModelAvailable: async () => true,
+    log: createLog(),
+    settings: null,
+    relayOptions: null,
+    allCombos: null,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(fallbackBody?.messages[1].content, longToolOutput);
+});
+
 test("handleComboChat suppresses hedging unless zero-latency optimizations are enabled", async () => {
   const calls: any[] = [];
 

@@ -14,7 +14,9 @@
  *    type, or when it is a general `chat`/`responses` node (a multimodal gateway
  *    that serves audio on the same base URL).
  *
- * 2. **host** — loopback/private nodes are always eligible. Remote nodes are
+ * 2. **host** — loopback/private nodes, and nodes whose host is on the
+ *    `OMNIROUTE_LOCAL_AUDIO_HOSTS` allowlist (e.g. in-cluster services), are always
+ *    eligible. Other remote nodes are
  *    opt-in via `AUDIO_REMOTE_PROVIDER_NODES`, default OFF: routing audio to an
  *    arbitrary remote host changes egress identity, so it must be an explicit
  *    operator decision rather than a silent default (cf. #3963).
@@ -24,7 +26,7 @@ import { getCachedProviderNodes } from "@/lib/db/readCache";
 import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
 import {
   buildDynamicAudioProvider,
-  isLoopbackNodeHost,
+  isLocalAudioNodeHost,
   type AudioProvider,
   type ProviderNodeRow,
 } from "@omniroute/open-sse/config/audioRegistry.ts";
@@ -34,9 +36,10 @@ export const AUDIO_REMOTE_NODES_FLAG = "AUDIO_REMOTE_PROVIDER_NODES";
 
 /**
  * Loopback / private-range hosts that never leave the operator's machine or
- * Docker network. `::1` stays excluded, matching the previous SSRF hardening.
+ * Docker network (`::1` stays excluded, matching the previous SSRF hardening),
+ * plus hosts the operator allowlisted via `OMNIROUTE_LOCAL_AUDIO_HOSTS`.
  */
-export { isLoopbackNodeHost as isLocalAudioNodeHost };
+export { isLocalAudioNodeHost };
 
 /**
  * Pure selection step — no DB, no flag lookup, so the policy is directly testable.
@@ -61,7 +64,7 @@ export function selectAudioProviderNodes(
       return false;
     }
     if (!node.baseUrl) return false;
-    return isLoopbackNodeHost(node.baseUrl) || allowRemote;
+    return isLocalAudioNodeHost(node.baseUrl) || allowRemote;
   });
 
   const providers: AudioProvider[] = [];

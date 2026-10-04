@@ -20,6 +20,7 @@ import { useIsElectron, useOpenExternal } from "@/shared/hooks/useElectron";
 import { HomeProviderTopologySection } from "./HomeProviderTopologySection";
 import { shouldShowProviderTopologyOnHome } from "./homeAppearance";
 import HomeRecentRequests from "../home/HomeRecentRequests";
+import { withProviderNodeEntries, type TopologyNodeRow } from "../home/topologyUtils";
 
 type UpdateStep = {
   step: string;
@@ -131,9 +132,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   const [selectedProvider, setSelectedProvider] = useState(null);
   const [providerMetrics, setProviderMetrics] = useState<Record<string, ProviderMetricSummary>>({});
   const [providerTopology, setProviderTopology] = useState({ lastProvider: "", errorProvider: "" });
-  const [providerNodes, setProviderNodes] = useState<
-    Array<{ id?: string; prefix?: string; name?: string }>
-  >([]);
+  const [providerNodes, setProviderNodes] = useState<TopologyNodeRow[]>([]);
 
   // The live in-flight request feed for the Provider Topology pulse animation is owned by
   // <HomeProviderTopologySection>, which subscribes to it (gated by the `enabled` prop)
@@ -519,7 +518,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
     providerConnections.forEach((conn) => addProvider(conn.provider));
     Object.keys(providerMetrics).forEach((provider) => addProvider(provider));
 
-    return Array.from(byProvider.values());
+    return withProviderNodeEntries(Array.from(byProvider.values()), providerNodes);
   }, [providerStats, providerMetrics, providerNodes, providerConnections]);
 
   const { lastProvider, errorProvider } = providerTopology;

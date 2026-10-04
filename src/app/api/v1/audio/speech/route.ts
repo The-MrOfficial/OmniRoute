@@ -19,6 +19,10 @@ import { attachOmniRouteMetaToResponse } from "@/domain/omnirouteResponseMeta";
 import { calculateModalCost } from "@/lib/usage/costCalculator";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { saveCallLog } from "@/lib/usageDb";
+import {
+  beginLiveRequest,
+  runLiveRequestTail,
+} from "@omniroute/open-sse/utils/liveRequestLifecycle.ts";
 
 /**
  * Handle CORS preflight
@@ -89,71 +93,90 @@ async function postHandler(request, context) {
   if (providerConfig && providerConfig.authType !== "none") {
     const credentialKey = providerConfig.credentialProviderId || provider;
     credentials = await getProviderCredentialsWithQuotaPreflight(credentialKey);
-    if (!credentials) {
+    // Allowlisted local hosts (`credentialsOptional`) proceed unauthenticated.
+    if (!credentials && !providerConfig.credentialsOptional) {
       return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${provider}`);
     }
-    if (isAllRateLimitedCredentials(credentials)) {
+    if (credentials && isAllRateLimitedCredentials(credentials)) {
       return rateLimitedProviderResponse(provider, credentials);
     }
   }
 
-  let response = await handleAudioSpeech({
-    body,
-    credentials,
-    resolvedProvider: providerConfig,
-    resolvedModel,
-  });
-
-  const connectionId = (credentials as { connectionId?: string } | null)?.connectionId || undefined;
-  const logModel = `${provider}/${resolvedModel || body.model}`;
-  const apiKeyId = policy.apiKeyInfo?.id || undefined;
-  const apiKeyName = policy.apiKeyInfo?.name || undefined;
-
-  if (response?.ok) {
-    await clearRecoveredProviderState(credentials);
-    // TTS is billed per input character; attach cost telemetry without
-    // touching the audio Content-Type / body (ADD-only headers).
-    const characters = typeof body.input === "string" ? body.input.length : 0;
-    const costUsd = await calculateModalCost("audio", provider, resolvedModel || body.model, {
-      characters,
+  // Live dashboard lifecycle (topology "active" state), paired started → completed/failed.
+  const live = beginLiveRequest({ provider, model: resolvedModel || body.model });
+  let response: Awaited<ReturnType<typeof handleAudioSpeech>>;
+  try {
+    response = await handleAudioSpeech({
+      body,
+      credentials,
+      resolvedProvider: providerConfig,
+      resolvedModel,
     });
-    response = attachOmniRouteMetaToResponse(response, {
-      provider,
-      model: resolvedModel || body.model,
-      costUsd,
-      latencyMs: Date.now() - startTime,
-      requestId: generateRequestId(),
-    });
-    saveCallLog({
-      method: "POST",
-      path: "/v1/audio/speech",
-      status: 200,
-      model: logModel,
-      provider,
-      connectionId,
-      duration: Date.now() - startTime,
-      apiKeyId,
-      apiKeyName,
-    }).catch(() => {});
-  } else if (response) {
-    const errorText = await response
-      .clone()
-      .text()
-      .catch(() => "");
-    saveCallLog({
-      method: "POST",
-      path: "/v1/audio/speech",
-      status: response.status,
-      model: logModel,
-      provider,
-      connectionId,
-      duration: Date.now() - startTime,
-      error: errorText.slice(0, 500),
-      apiKeyId,
-      apiKeyName,
-    }).catch(() => {});
+  } catch (error) {
+    live.finish({ status: 500, error: error instanceof Error ? error.message : String(error) });
+    throw error;
   }
-  return response;
+  if (!response) live.finish({ status: 502, error: "No response" });
+
+  // A throw anywhere in the post-processing tail must still finish the live request.
+  return runLiveRequestTail(live, async () => {
+    const connectionId =
+      (credentials as { connectionId?: string } | null)?.connectionId || undefined;
+    const logModel = `${provider}/${resolvedModel || body.model}`;
+    const apiKeyId = policy.apiKeyInfo?.id || undefined;
+    const apiKeyName = policy.apiKeyInfo?.name || undefined;
+
+    if (response?.ok) {
+      await clearRecoveredProviderState(credentials);
+      // TTS is billed per input character; attach cost telemetry without
+      // touching the audio Content-Type / body (ADD-only headers).
+      const characters = typeof body.input === "string" ? body.input.length : 0;
+      const costUsd = await calculateModalCost("audio", provider, resolvedModel || body.model, {
+        characters,
+      });
+      response = attachOmniRouteMetaToResponse(response, {
+        provider,
+        model: resolvedModel || body.model,
+        costUsd,
+        latencyMs: Date.now() - startTime,
+        requestId: generateRequestId(),
+      });
+      saveCallLog({
+        method: "POST",
+        path: "/v1/audio/speech",
+        status: 200,
+        model: logModel,
+        provider,
+        connectionId,
+        duration: Date.now() - startTime,
+        apiKeyId,
+        apiKeyName,
+      }).catch(() => {});
+      live.finish({ status: 200 });
+    } else if (response) {
+      const errorText = await response
+        .clone()
+        .text()
+        .catch(() => "");
+      saveCallLog({
+        method: "POST",
+        path: "/v1/audio/speech",
+        status: response.status,
+        model: logModel,
+        provider,
+        connectionId,
+        duration: Date.now() - startTime,
+        error: errorText.slice(0, 500),
+        apiKeyId,
+        apiKeyName,
+      }).catch(() => {});
+      live.finish({
+        status: response.status,
+        error: errorText.slice(0, 500) || `HTTP ${response.status}`,
+      });
+    }
+    return response;
+  });
 }
 
 export const POST = withInjectionGuard(postHandler);

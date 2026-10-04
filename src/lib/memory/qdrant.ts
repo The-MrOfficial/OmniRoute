@@ -1,5 +1,6 @@
 import { getSettings } from "@/lib/db/settings";
 import { createEmbeddingResponse } from "@/lib/embeddings/service";
+import { MAX_EMBED_CHUNK_CHARS, embedTextChunked } from "@/lib/memory/embedding/chunking";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -287,20 +288,32 @@ async function embedText(cfg: QdrantConfig, text: string): Promise<number[]> {
     throw new Error(`Invalid embedding model '${modelStr}'. Use provider/model format.`);
   }
 
-  const res = await createEmbeddingResponse({
-    model: modelStr,
-    input: text,
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(txt.slice(0, 300) || `Embeddings request failed (${res.status})`);
-  }
-  const data = (await res.json().catch(() => null)) as any;
-  const vec = data?.data?.[0]?.embedding;
-  if (!Array.isArray(vec) || vec.length === 0) {
-    throw new Error("Embedding response missing vector");
-  }
-  return vec as number[];
+  // Long texts are chunked (≤12k chars, one request per chunk) and mean-pooled into the
+  // single vector this memory's Qdrant point holds; see memory/embedding/chunking.ts.
+  // A text that fits in one chunk is embedded exactly as before (raw doubles, no pooling).
+  const embedRaw = async (chunk: string): Promise<number[]> => {
+    const res = await createEmbeddingResponse(
+      { model: modelStr, input: chunk },
+      { internalCaller: true }
+    );
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(txt.slice(0, 300) || `Embeddings request failed (${res.status})`);
+    }
+    const data = (await res.json().catch(() => null)) as any;
+    const vec = data?.data?.[0]?.embedding;
+    if (!Array.isArray(vec) || vec.length === 0) {
+      throw new Error("Embedding response missing vector");
+    }
+    return vec as number[];
+  };
+  if (text.length <= MAX_EMBED_CHUNK_CHARS) return embedRaw(text);
+  const vector = await embedTextChunked(
+    text,
+    async (chunk) => new Float32Array(await embedRaw(chunk)),
+    (value): value is Float32Array => value instanceof Float32Array
+  );
+  return Array.from(vector);
 }
 
 export async function upsertSemanticMemoryPoint(input: {

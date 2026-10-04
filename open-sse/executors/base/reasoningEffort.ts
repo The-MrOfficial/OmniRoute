@@ -9,6 +9,11 @@ import {
   getProviderModels,
 } from "../../config/providerModels.ts";
 import {
+  getRegistryEntry,
+  getRegistryModelThinkingEfforts,
+  getRegistryOmitEffortAboveCeiling,
+} from "../../config/providerRegistry.ts";
+import {
   getLearnedReasoningEffort,
   clampToLearned,
   REASONING_EFFORT_ORDER,
@@ -306,7 +311,8 @@ export function sanitizeReasoningEffortForProvider(
   body: unknown,
   provider: string,
   model: string | undefined,
-  log?: ReasoningSanitizeLog | null
+  log?: ReasoningSanitizeLog | null,
+  overrideLookup?: (provider: string, modelId: string) => readonly string[] | null
 ): unknown {
   if (isNvidiaGlm52(provider, model)) {
     return mapNvidiaGlm52ReasoningParams(body, provider, model, log);
@@ -578,19 +584,67 @@ export function sanitizeReasoningEffortForProvider(
   const providerModelIdForClamp = modelStr.startsWith(`${provider}/`)
     ? modelStr.slice(provider.length + 1)
     : modelStr;
-  const declaredEfforts = getProviderModels(provider).find(
-    (entry) =>
-      entry.id === providerModelIdForClamp || entry.aliases?.includes(providerModelIdForClamp)
-  )?.supportedThinkingEfforts;
+  // Ollama-shaped ids are always "family:tag" (Ollama's own naming convention,
+  // e.g. "qwen3:14b-q4_K_M"); detected generically by the presence of ":", not
+  // a provider allowlist, so this also covers any future self-hosted provider
+  // (vllm, lm-studio, ...) that adopts the same convention. Verified a no-op for
+  // every current colon-id registry entry (ollama-cloud's declared models exact-
+  // match first; its default-only models have no colliding bare-family entry).
+  const ollamaFamilyId = providerModelIdForClamp.includes(":")
+    ? providerModelIdForClamp.slice(0, providerModelIdForClamp.indexOf(":"))
+    : null;
+  // Resolution order (critical — see design Finding 1): operator override wins,
+  // then the model-level static vocabulary (exact id, then family-prefix id,
+  // both via getRegistryModelThinkingEfforts which does NOT fold in the provider
+  // default), and only then the provider-level defaultSupportedThinkingEfforts.
+  // Calling getRegistryThinkingEfforts() here instead would short-circuit on the
+  // provider default and make the family-prefix opt-out probe dead code.
+  const overrideEfforts =
+    overrideLookup?.(provider, providerModelIdForClamp) ??
+    (ollamaFamilyId ? overrideLookup?.(provider, ollamaFamilyId) : undefined) ??
+    undefined;
+  const modelEfforts =
+    overrideEfforts ??
+    getRegistryModelThinkingEfforts(provider, providerModelIdForClamp) ??
+    (ollamaFamilyId ? getRegistryModelThinkingEfforts(provider, ollamaFamilyId) : undefined);
+  const declaredEfforts =
+    modelEfforts ?? getRegistryEntry(provider)?.defaultSupportedThinkingEfforts;
   const declaredRanked = (Array.isArray(declaredEfforts) ? declaredEfforts : [])
     .map((tier) => ({ tier, rank: REASONING_EFFORT_ORDER.indexOf(tier) }))
     .filter((x) => x.rank >= 0)
     .sort((a, b) => a.rank - b.rank);
   if (declaredRanked.length > 0 && !declaredEfforts!.includes(effortStr)) {
     const requestedRank = REASONING_EFFORT_ORDER.indexOf(effortStr);
-    const nearest =
-      declaredRanked.find((x) => x.rank >= requestedRank) ??
-      declaredRanked[declaredRanked.length - 1];
+    const atOrBelowCeiling = declaredRanked.find((x) => x.rank >= requestedRank);
+    // "Drop above ceiling" (ollama-local qwen3.5/qwen3.8 family): the backend's
+    // chat template is self-inconsistent — it advertises its TOP tier (xhigh)
+    // as the OMITTED default, but rejects every explicit spelling of it: literal
+    // "high" raises `Unexpected reasoning effort high`, and literal "xhigh" is
+    // internally rewritten to "max" and then raises `Unexpected reasoning effort
+    // max`. Only values AT/BELOW the declared ceiling (low, medium) succeed when
+    // sent explicitly. So for a request ABOVE the ceiling we must OMIT the field
+    // entirely (not clamp to a literal value) and let the template apply its own
+    // top-tier default — delivering max reasoning, which is the request's intent.
+    // Only engages when nothing in the declared vocabulary is >= the request
+    // (`atOrBelowCeiling` is undefined), which is exactly the above-ceiling case;
+    // low/medium stay on the normal clamp path below.
+    const omitAboveCeiling =
+      !atOrBelowCeiling &&
+      (getRegistryOmitEffortAboveCeiling(provider, providerModelIdForClamp) ||
+        (ollamaFamilyId ? getRegistryOmitEffortAboveCeiling(provider, ollamaFamilyId) : false)) &&
+      // The omit policy describes the backend TEMPLATE default, so it only
+      // applies when the ceiling we matched is the model/provider's own declared
+      // vocabulary — never when an operator override supplied the vocabulary
+      // (an override that tops out at medium means "clamp to medium", not "omit").
+      overrideEfforts === undefined;
+    if (omitAboveCeiling) {
+      log?.info?.(
+        "REASONING_SANITIZE",
+        `${provider}/${modelStr}: dropped reasoning_effort ${effortStr} (above declared ceiling ${declaredEfforts!.join("/")}; backend applies its own top-tier default)`
+      );
+      return stripEffortValue(b, c);
+    }
+    const nearest = atOrBelowCeiling ?? declaredRanked[declaredRanked.length - 1];
     log?.info?.(
       "REASONING_SANITIZE",
       `${provider}/${modelStr}: mapped reasoning_effort ${effortStr} → ${nearest.tier} (model accepts ${declaredEfforts!.join("/")})`

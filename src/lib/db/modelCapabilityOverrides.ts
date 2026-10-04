@@ -4,12 +4,10 @@ import {
   type ReasoningEffortOverrideValue,
 } from "@/shared/reasoning/reasoningEffortsOverride";
 import { getDbInstance } from "./core";
-import { invalidateDbCache } from "./readCache";
+import { getModelCatalogCacheVersion, invalidateDbCache } from "./readCache";
 
 export type NumericModelCapabilityOverrideKey =
-  | "max_input_tokens"
-  | "max_output_tokens"
-  | "max_token";
+  "max_input_tokens" | "max_output_tokens" | "max_token";
 export type ModelCapabilityOverrideKey = NumericModelCapabilityOverrideKey | "reasoning_efforts";
 
 interface ModelCapabilityOverrideBase {
@@ -150,6 +148,49 @@ export function getReasoningEffortsOverride(
   } catch {
     return null;
   }
+}
+
+type ReasoningEffortsOverrideBulkMap = ReadonlyMap<
+  string,
+  ReadonlyMap<string, readonly ReasoningEffortOverrideValue[]>
+>;
+
+let reasoningEffortsOverrideCache: ReasoningEffortsOverrideBulkMap | null = null;
+let reasoningEffortsOverrideCacheVersion = -1;
+
+function loadReasoningEffortsOverrideMap(): ReasoningEffortsOverrideBulkMap {
+  const map = new Map<string, Map<string, readonly ReasoningEffortOverrideValue[]>>();
+  for (const override of listModelCapabilityOverrides()) {
+    if (override.key !== "reasoning_efforts") continue;
+    const providerMap = map.get(override.provider) ?? new Map();
+    providerMap.set(override.modelId, override.value);
+    map.set(override.provider, providerMap);
+  }
+  return map;
+}
+
+/**
+ * Cached wrapper for getReasoningEffortsOverride(), safe to call on every
+ * forwarding-path request. Mirrors loadParamFilterConfigs()'s
+ * cache-until-invalidated pattern: rebuilds the full reasoning_efforts override
+ * table at most once per modelCatalogCacheVersion bump (i.e. once per write via
+ * setModelCapabilityOverride/removeModelCapabilityOverride, which already call
+ * invalidateDbCache("model-capabilities") → invalidateModelCatalogCache()),
+ * never once per request.
+ */
+export function getCachedReasoningEffortsOverride(
+  provider: string | null | undefined,
+  modelId: string | null | undefined
+): readonly ReasoningEffortOverrideValue[] | null {
+  const currentVersion = getModelCatalogCacheVersion();
+  if (
+    reasoningEffortsOverrideCache === null ||
+    reasoningEffortsOverrideCacheVersion !== currentVersion
+  ) {
+    reasoningEffortsOverrideCache = loadReasoningEffortsOverrideMap();
+    reasoningEffortsOverrideCacheVersion = currentVersion;
+  }
+  return getReasoningEffortsOverride(provider, modelId, reasoningEffortsOverrideCache);
 }
 
 export function setModelCapabilityOverride(

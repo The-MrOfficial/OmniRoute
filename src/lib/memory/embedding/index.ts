@@ -309,6 +309,12 @@ export async function embed(
  * stored but never vectorized until the next reindex sweep. The retry covers
  * error results only; a thrown error still propagates to the caller's catch
  * (scheduleVectorUpsert marks needs_reindex there, as before).
+ *
+ * A timeout or 5xx is not retried: the input may be the poison item that
+ * wedged the embed server, and resending it at once would wedge it again. The
+ * caller marks the memory needs_reindex and the reindex sweep retries it later.
+ * Rate limits, network errors without a status, and model-load failures still
+ * get the one retry; 4xx failures are deterministic, so their retry is harmless.
  */
 export async function embedWithRetry(
   text: string,
@@ -323,6 +329,7 @@ export async function embedWithRetry(
   for (let attempt = 1; attempt <= Math.max(1, maxAttempts); attempt++) {
     const result = await embedFn(text, settings);
     if ("vector" in result) return result;
+    if (result.reason === "timeout" || (result.status ?? 0) >= 500) return result;
     last = result;
   }
   return last as EmbeddingResult | EmbeddingError;

@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { appendToolCallArgumentDelta } from "../../open-sse/utils/toolCallArguments.ts";
+import {
+  appendToolCallArgumentDelta,
+  unwrapStringifiedToolArgFields,
+} from "../../open-sse/utils/toolCallArguments.ts";
 
 /**
  * Helper: reduce a list of incremental delta fragments the way the streaming
@@ -33,7 +36,10 @@ test("appendToolCallArgumentDelta dedups an identical full-snapshot repeat", () 
 
 test("appendToolCallArgumentDelta replaces a growing full snapshot instead of concatenating", () => {
   assert.equal(appendToolCallArgumentDelta('{"a"', '{"a":1}'), '{"a":1}');
-  assert.equal(appendToolCallArgumentDelta('{"command":"ec', '{"command":"echo hi"}'), '{"command":"echo hi"}');
+  assert.equal(
+    appendToolCallArgumentDelta('{"command":"ec', '{"command":"echo hi"}'),
+    '{"command":"echo hi"}'
+  );
 });
 
 test("appendToolCallArgumentDelta handles empty / non-string inputs", () => {
@@ -43,4 +49,54 @@ test("appendToolCallArgumentDelta handles empty / non-string inputs", () => {
   assert.equal(appendToolCallArgumentDelta("x", undefined), "x");
   assert.equal(appendToolCallArgumentDelta(null, null), "");
   assert.equal(appendToolCallArgumentDelta(42, "x"), "x");
+});
+
+test("unwrapStringifiedToolArgFields un-stringifies a nested JSON-string array (GLM parallel_tasks)", () => {
+  // Self-hosted llama.cpp GLM emits the tasks array as a quoted JSON string.
+  const broken = JSON.stringify({
+    tasks: JSON.stringify([
+      { name: "spec-digest", mode: "project-research", message: "Read the spec." },
+      { name: "impl", mode: "code", message: "Implement it." },
+    ]),
+  });
+  const fixed = unwrapStringifiedToolArgFields(broken);
+  const parsed = JSON.parse(fixed);
+  assert.ok(Array.isArray(parsed.tasks), "tasks must become a real array");
+  assert.equal(parsed.tasks.length, 2);
+  assert.equal(parsed.tasks[0].name, "spec-digest");
+  assert.ok(!fixed.includes('"[{'), "no residual stringified-array wrapping");
+});
+
+test("unwrapStringifiedToolArgFields un-stringifies a nested JSON-string object", () => {
+  const broken = JSON.stringify({ payload: JSON.stringify({ a: 1, b: "two" }) });
+  const parsed = JSON.parse(unwrapStringifiedToolArgFields(broken));
+  assert.deepEqual(parsed.payload, { a: 1, b: "two" });
+});
+
+test("unwrapStringifiedToolArgFields leaves plain string fields untouched", () => {
+  // A path/command/prose must NOT be coerced even though it is a string.
+  const ok = JSON.stringify({ path: "/a/b/c.ts", command: "ls -ll", note: "[draft] see below" });
+  assert.equal(unwrapStringifiedToolArgFields(ok), ok);
+});
+
+test("unwrapStringifiedToolArgFields is byte-identical passthrough for already-correct args", () => {
+  const good = JSON.stringify({ tasks: [{ name: "x", mode: "code" }] });
+  assert.equal(unwrapStringifiedToolArgFields(good), good);
+});
+
+test("unwrapStringifiedToolArgFields leaves incomplete/invalid JSON unchanged (streaming fragment)", () => {
+  assert.equal(unwrapStringifiedToolArgFields('{"tasks":"[{"name"'), '{"tasks":"[{"name"');
+  assert.equal(unwrapStringifiedToolArgFields(""), "");
+  assert.equal(unwrapStringifiedToolArgFields("not json"), "not json");
+});
+
+test("unwrapStringifiedToolArgFields does not treat a non-object root as repairable", () => {
+  const arr = JSON.stringify([{ name: "x" }]);
+  assert.equal(unwrapStringifiedToolArgFields(arr), arr);
+});
+
+test("unwrapStringifiedToolArgFields returns empty string for non-string input", () => {
+  assert.equal(unwrapStringifiedToolArgFields(undefined), "");
+  assert.equal(unwrapStringifiedToolArgFields(null), "");
+  assert.equal(unwrapStringifiedToolArgFields(42), "");
 });

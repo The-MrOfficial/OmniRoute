@@ -6,6 +6,7 @@ import { byteplusProvider } from "./registry/byteplus/index.ts";
 import { mlxGemmaProvider } from "./registry/mlx/index.ts";
 import { mlxQwenProvider } from "./registry/mlx/index.ts";
 import { ollama_cloudProvider } from "./registry/ollama-cloud/index.ts";
+import { ollama_localProvider } from "./registry/ollama-local/index.ts";
 import { syntheticProvider } from "./registry/synthetic/index.ts";
 import { ideogramProvider } from "./registry/ideogram/index.ts";
 import { friendliaiProvider } from "./registry/friendliai/index.ts";
@@ -280,6 +281,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
   "mlx-gemma": mlxGemmaProvider,
   "mlx-qwen": mlxQwenProvider,
   "ollama-cloud": ollama_cloudProvider,
+  "ollama-local": ollama_localProvider,
   synthetic: syntheticProvider,
   ideogram: ideogramProvider,
   friendliai: friendliaiProvider,
